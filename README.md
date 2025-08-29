@@ -104,7 +104,7 @@ If you have a relatively small number of objects in your bucket, or are looking 
 
 ## Simple demo
 
-For a simple demonstration example, costing around $0.75 ($0.25 per S3 Batch Operations job), perform the following:
+For a simple demonstration example, costing around $0.75 (for the three S3 Batch Operations jobs), perform the following:
 
 1. Create a new S3 bucket for testing, with versioning enabled. Keep all other defaults.
 2. Upload objects `a` and `b`. **This is your desired (good) state**. Note the time, adjusted to the UTC timezone.
