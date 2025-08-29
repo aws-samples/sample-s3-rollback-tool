@@ -790,6 +790,35 @@ Resources:
           ResultsBucket: !Ref AthenaResultsBucket
           Bucket: !Ref BucketName
 
+  CreateScenario2UndoTable:
+    Type: "AWS::Athena::NamedQuery"
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates an Athena table to *undo* Scenario 2"
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub
+        - |
+            -- Creates an Athena table to *undo* Scenario 2;
+            -- Replace any delete markers removed when originally running Scenario2
+            -- This CSV can then be passed to the Scenario1 Lambda using S3 Batch Operations
+
+            CREATE TABLE ${GlueDB}.scenario2_undo_keys WITH (
+                format = 'TEXTFILE',
+                field_delimiter = ',',
+                write_compression = 'NONE',
+                external_location = 's3://${ResultsBucket}/Tables/scenario2_undo_keys_table/'
+            ) as
+            select
+                bucket,
+                key
+            from
+                ${GlueDB}.scenario2_keys
+            
+        - GlueDB: !Ref GlueDatabase
+          TimeStamp: !Ref TimeStamp
+          ResultsBucket: !Ref AthenaResultsBucket
+          Bucket: !Ref BucketName
+
   CreateScenario3aTable:
     Type: "AWS::Athena::NamedQuery"
     Properties:
@@ -1476,6 +1505,18 @@ Resources:
       WorkGroup: !Ref AthenaWorkGroup
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario2Table/"
 
+  ExecuteCreateScenario2UndoTable:
+    Type: "Custom::ExecuteCreateScenario2UndoTableFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateScenario2Table
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateScenario2UndoTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario2UndoTable/"
+
   ExecuteCreateScenario3aTable:
     Type: "Custom::ExecuteCreateScenario3aTableFunction"
     DependsOn:
@@ -1521,6 +1562,7 @@ Resources:
     - ExecuteClean
     - ExecuteCreateScenario1Table
     - ExecuteCreateScenario2Table
+    - ExecuteCreateScenario2UndoTable
     - ExecuteCreateScenario3aTable
     - ExecuteCreateScenario3bTable
     - ExecuteCreateScenario3cTable
@@ -1533,6 +1575,7 @@ Resources:
       Tables:
         - scenario1
         - scenario2
+        - scenario2_undo
         - scenario3a
         - scenario3b
         - scenario3c
@@ -1809,7 +1852,7 @@ Resources:
     Type: "AWS::Lambda::Function"
     Properties:
       Runtime: python3.13
-      MemorySize: 1024
+      MemorySize: 256
       Timeout: 900
       Handler: "index.handler"
       Role: !GetAtt S3BatchOpsDeleteFunctionRole.Arn
