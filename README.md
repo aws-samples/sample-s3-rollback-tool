@@ -125,7 +125,7 @@ For a simple demonstration example, costing around $0.75 (for the three S3 Batch
    
    ![DT state with versions](images/badstate(versions).png)
 
-4. Create a real-time inventory (see [Creating a real-time inventory using the ListObjectVersions API](#creating-a-real-time-inventory-using-the-listobjectversions-api)), and copy the output CSV into S3 into an otherwise empty 'folder' (prefix ending in /).
+4. Create a real-time inventory (see [Creating a real-time inventory using the ListObjectVersions API](#creating-a-real-time-inventory-using-the-listobjectversions-api)), and copy the output CSV into S3 into an otherwise empty '[folder](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-folders.html)' (prefix ending in `/`).
 5. Deploy the [CloudFormation template](s3-rollback.yaml).
    - Enter the name of the test bucket you just created.
    - Enter a timestamp (in UTC) after step 2 but before step 3. In this example, it was 2025-08-22T11:01:00 .
