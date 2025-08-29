@@ -194,8 +194,8 @@ To do this, delete the CloudFormation stack. This will delete any CSV manifests 
 
 ## Tenets
 
-* **Works at any scale**: Tested at 10B object scale with 1B changes. Efficiency is key to achieving this. Re-running with a new index (to catch up, or following failures/cancellations) will not repeat completed operations.
-* **Fast at any scale:** Revert 1M changes in a 10B object bucket in under 1 hour, end to end, using S3 Inventory. Revent a few thousand changes in a bucket with a few hundred objects in under 10 minutes, including real-time inventory CSV creation.
+* **Works at any scale**: Designed to support 10B object buckets with 1B changes. Efficiency is key to achieving this. Re-running with a new index (to catch up, or following failures/cancellations) will not repeat completed operations.
+* **Fast at any scale:** Revert 1M changes in a 10B object bucket in under 1 hour, end to end, using S3 Inventory. Revert a few thousand changes in a bucket with a few hundred objects in under 10 minutes, including real-time inventory CSV creation.
 * **Do no harm:** Do not delete data (never regular object versions, only delete markers). BOPS jobs are created but not started by default.
 * **Flexible**: Use any index. Give users control of prefix or regex, and which operations to carry out. 
 * **No assumptions**: Don’t assume which operations the user wants to run, which storage class to copy to, or encryption to use for copies. We can’t know what’s ‘correct’, so we ask.
