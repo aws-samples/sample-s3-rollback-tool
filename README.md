@@ -146,7 +146,7 @@ For a simple demonstration example, costing around $0.75 (for the three S3 Batch
 
 ## KMS permissions
 
-The roles created by this tool **will not have IAM or KMS permissions to any KMS keys**. If you have have objects in scope that are encrypted with KMS, or you have specified that the solution should use a KMS key when copying objects, or your bucket has default encruption set to a KMS key, you will need to update permissions before starting the Batch Operations copy jobs (Scenario 3). The ARNs that require permissions are shows in the `CopyRole3b` and `CopyRole3c` output of the CloudFormation script.
+The roles created by this tool **will not have IAM or KMS permissions to any KMS keys**. If you have have objects in scope that are encrypted with KMS, or you have specified that the solution should use a KMS key when copying objects, or your bucket has default encryption set to a KMS key, you will need to update permissions before starting the Batch Operations copy jobs (Scenario 3). The ARNs that require permissions are shows in the `CopyRole3b` and `CopyRole3c` output of the CloudFormation script.
 
 Permissions required:
 - KMS decrypt for object versions to be copied
