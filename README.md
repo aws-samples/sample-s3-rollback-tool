@@ -6,7 +6,7 @@ If you want to revert lots of changes to a large dataset in Amazon S3, as quickl
 
 Undesired ‘soft DELETE’, ‘overwrite PUT’ and ‘fresh PUT’ operations are all in scope. Changes to storage class (by S3 Lifecycle) or to Object Tags are not in scope, as these do not create new object versions.
 
-The tool will not delete any data - it works by adding and removing delete markers, and copying object versions where necessary, to revert a dataset to an earlier time. 
+The tool will not delete any data - it works by adding and removing delete markers, and copying object versions where necessary, to revert a dataset to an earlier time as efficiently as possible. 
 
 ***`Note: S3 Metadata table support is coming soon.`***
 
