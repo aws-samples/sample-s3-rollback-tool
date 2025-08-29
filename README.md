@@ -75,7 +75,6 @@ The CloudFormation template creates the following resources:
 
 * An S3 bucket to store Athena output (known as the solution bucket), and associated [AWS Glue database](https://docs.aws.amazon.com/glue/latest/dg/define-database.html) and [Athena tables](https://docs.aws.amazon.com/athena/latest/ug/creating-tables.html).
    - By default, new S3 buckets have Block Public Access enabled and encrypt new objects at rest with SSE-S3.
-* If S3 Metadata is used, an S3 Table bucket, namespace and table will be created in order to process the metadata tables and determine the latest state and current version of each object key.
 * Lambda functions to create the above resources, determine which inventory to use, orchestrate Athena queries, create manifests in the correct formats, create S3 Batch Operations jobs, and clean up the solution bucket when the CloudFormation stack is deleted.
 * IAM roles for use by the tool.
 
