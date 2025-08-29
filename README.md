@@ -65,16 +65,16 @@ For each object key (name) in scope of the prefix filter:
 
 The tool requires an index of the bucket or prefix in scope. If none is available, the deployment will fail.
 
-* If the **ObjectListCSV** field has an entry, the tool will read it from the specified S3 location. if it cannot read or process this file, the deployment will fail.
-* If the above is left blank, the tool will check the S3 Metadata configuration of the selected bucket. If an S3 Metadata inventory table is configured for the bucket, it will use this.
+* If the **ObjectListCSV** field has an entry, the tool will read it from the specified S3 location. If it cannot read or process this file, the deployment will fail.
+* If the above is left blank, the tool will check the S3 Metadata configuration of the selected bucket. If an S3 Metadata live inventory table is configured for the bucket, it will use this in conjunction with the journal table to calculate the latest inventory.
 * Otherwise, the tool will look at the S3 Inventory configuration of the selected bucket. It evaluates the available inventories, and will use the latest S3 Inventory report that is in [Parquet or Apache ORC](https://docs.aws.amazon.com/athena/latest/ug/columnar-storage.html) format and includes all versions as well as all [additional metadata](https://docs.aws.amazon.com/AmazonS3/latest/userguide/configure-inventory.html#configure-inventory-console). If a prefix has been specified in the CloudFormation deployment, the tool will prioritize inventories matching or containing the specified prefix. If no prefix is specified, there must be a valid S3 Inventory configuration containing all objects in the bucket, or the deployment will fail.
 
 ***`Note: S3 Metadata table support is coming soon.`***
 
 The CloudFormation template creates the following resources:
 
-* An S3 bucket to store Athena output (known as the solution bucket), and associated [AWS Glue database](https://docs.aws.amazon.com/glue/latest/dg/define-database.html) and [Athena tables](https://docs.aws.amazon.com/athena/latest/ug/creating-tables.html).
-   - By default, new S3 buckets have Block Public Access enabled and encrypt new objects at rest with SSE-S3.
+* An S3 bucket to store Athena output (known as the solution bucket), associated [AWS Glue database](https://docs.aws.amazon.com/glue/latest/dg/define-database.html) and [Athena tables](https://docs.aws.amazon.com/athena/latest/ug/creating-tables.html), plus S3 Batch Operations manifests and reports.
+   - By default, new S3 buckets have Block Public Access enabled and new objects are encrypted at rest with SSE-S3.
 * Lambda functions to create the above resources, determine which inventory to use, orchestrate Athena queries, create manifests in the correct formats, create S3 Batch Operations jobs, and clean up the solution bucket when the CloudFormation stack is deleted.
 * IAM roles for use by the tool.
 
@@ -83,6 +83,7 @@ The tool outputs manifest files for S3 Batch Operations jobs, in the S3 path ref
 
 * **Scenario 1**:  Where all version of key have last_modified after the desired Point In Time (PIT), or the current version at the desired PIT was a delete marker, and current version is not a delete marker. **Add a delete marker.**
 * **Scenario 2:**  Keys where there are only delete markers (no new objects) after the PIT. **These delete markers will be deleted.**
+    * `scenario2-undo.csv` will also be created so that these can be recreated if needed. See [FAQ #3](#faqs).
 * **Scenarios 3a, b and c:** Keys where there was an object (not a delete marker) at the PIT, and there is current version newer than at the PIT. Excludes keys covered by scenarios 1 and 2. **The desired VersionID must be copied back to the top of the top.**
     * **3a:** Desired VersionID is in GFR/GDA class and needs to be restored from async. **This tool will not copy these objects**, but output its details in the `scenario3a.csv` manifest that can be used with [**Guidance for Automated Restore and Copy for Amazon S3 Glacier Objects**](https://github.com/aws-solutions-library-samples/guidance-for-automated-restore-and-copy-for-amazon-s3-glacier-objects).
         * Note that as ListObjectVersions and S3 Metadata don't report Intelligent Tiering tier, objects versions that need to be retrieved before being copied from the opt-in Archive and Deep Archive tiers won’t be included here unless an S3 Inventory source is used. Instead they will be included in scenario 3b or 3c, and an attempt made to copy them. These copy attempts will fail with `403: InvalidObjectState` 
@@ -166,9 +167,8 @@ This tool will not assign reserved concurrency to Lambda operations, and may con
     - This tool will take the appropriate action to revert changes, based on the available inventory information at the time of deployment. The impact of a subsequent change depends on its nature, and whether it took place before or after the specific S3 Batch Operations job (created  by this rollback tool) took its action. However, in all cases, running the rollback tool *again*, with an inventory that includes new changes, will correctly revert the new changes. Note: If the new inventory includes copies made by this tool (scenario 3), those copies will be repeated as it isn't possible to tell from an inventory that the current object version's data is identical to the desired version.
 3. I used this tool to roll back my bucket, and want to undo the changes. Can I do that?
     - Yes, provided you have not yet deleted the CloudFormation stack from the original deployment. This is a 2-step process:
-      1. Once you have an inventory that includes the changes made by this tool, you can deploy the tool again to roll back to the point in time just prior to the initial deployment. If you have S3 Metadata inventory enabled, simply wait 15 minutes to ensure all changes have been written to the journal. 
-      2. Once the above is complete, you need to re-create any delete markers created by the original deployment, as the updated inventory has no knowledge of these. To do this, create an S3 Batch Operations job, choose the CSV manifest `scenario2.csv` from the *original deployment*, leaving **Manifest includes version IDs** unchecked. Choose **Invoke AWS Lambda function** as the operation type, and choose a function titled `<stack name>-S3BatchOpsDeleteFunction-<unique-id>` (you can find this name in the resources output of either deployment) and **Invocation schema version 2.0**.
-      3. ***this doesn't work, manifest must have 2 columns not 3. working on solution***
+      1. Once you have an inventory that includes the changes made by this tool, deploy the tool again to roll back to the point in time just prior to the initial deployment. If you have S3 Metadata inventory enabled, simply wait 15 minutes to ensure all changes have been written to the journal. 
+      2. Once the above is complete, you need to re-create any delete markers created by the original deployment, as the updated inventory has no knowledge of these. To do this, create an S3 Batch Operations job, choose the CSV manifest `scenario2-undo.csv` from the *original deployment*, leaving **Manifest includes version IDs** unchecked. Choose **Invoke AWS Lambda function** as the operation type, the function titled `<original stack name>-S3BatchOpsDeleteFunction-<unique-id>` (you can find this name in the **Resources** output of the deployment) and **Invocation schema version 2.0**. Run the job with the role titled `<original stack name>-S3BatchOpsExecutorRole--<unique-id>`.
 4. What happens when I delete the CloudFormation stack?
     - Any S3 Batch Operations jobs not in COMPLETE state will be cancelled.
     - All created resources will be deleted, including the temporary S3 and S3 Tables buckets.
@@ -182,7 +182,7 @@ This tool will not assign reserved concurrency to Lambda operations, and may con
 
 The charges for deploying this solution are minimal. S3 Batch Operations charges per object as well as per job. Rollback COPY requests incur the usual S3 charges, while DELETE requests have no cost other than for the Lambda compute to initiate them. Amazon Athena charges scale with the number of objects in scope.
 
-For example, if you use this tool against an entire bucket (with an existing Amazon S3 Inventory) containing 1 billion objects, to roll back 1 million fresh PUTs, 1 million overwrite PUTs and 1 million DELETEs since the desired point-in-time, **the total cost would be approximately $12** ($1 Athena, $5 S3 PUTs, $4 S3 Batch Operations, $2 lambda).
+For example, if you use this tool against an entire bucket in us-east-1 containing 1 billion objects, and with an existing Amazon S3 Inventory, to roll back 1 million fresh PUTs, 1 million overwrite PUTs and 1 million DELETEs since the desired point-in-time, **the total cost would be approximately $12** ($1 Athena, $5 S3 PUTs, $4 S3 Batch Operations, $2 lambda).
 
 Amazon S3 pricing is available at [https://aws.amazon.com/s3/pricing](https://aws.amazon.com/s3/pricing/).
 
