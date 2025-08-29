@@ -98,9 +98,9 @@ All S3 Batch Operations jobs created by this tool report completion reports, inc
 
 ## Creating a real-time inventory using the ListObjectVersions API
 
-The S3 rollback tool has been designed for use at scale (up to 10 billion objects in scope). At this scale, S3 Inventory or S3 Metadata inventory tables are necessary in order to obtain a listing of all the object versions and their details.
+The S3 rollback tool has been designed for use at scale (up to 10 billion objects in scope). At this scale, S3 Inventory or S3 Metadata inventory tables are necessary in order to obtain an inventory of all the object versions and their details.
 
-If you have a relatively small number of objects in your bucket, or are looking to perform rapid iterative testing of this tool, you may prefer to list all the objects in scope rather than use S3 Inventory or S3 Metadata. The example script provided at https://github.com/aws-samples/sample-s3-listobjectversions-to-csv/ uses [list_object_versions with boto3](https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/list_object_versions.html) to output all object versions in a bucket (and optionally prefix), into a CSV format that can be used with this tool. The example script has been tested with 3 million object versions in scope, completing output of a 432 MiB file in 15 minutes (on a t2.micro instance), and with 50 million in scope, outputting approximately 7 GiB in 5 hours.
+If you have a relatively small number of objects in your bucket, or are looking to perform rapid iterative testing of this tool, you may prefer to LIST all the objects in scope rather than use S3 Inventory or S3 Metadata. The example script provided at https://github.com/aws-samples/sample-s3-listobjectversions-to-csv/ uses [list_object_versions with boto3](https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/list_object_versions.html) to output all object versions in a bucket (and optionally prefix), into a CSV format that can be used with this tool. The example script has been tested with 3 million object versions in scope, completing output of a 432 MiB file in 15 minutes (on a t2.micro instance), and with 50 million in scope, outputting approximately 7 GiB in 5 hours.
 
 ## Simple demo
 
