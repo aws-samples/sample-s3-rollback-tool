@@ -1,0 +1,2130 @@
+Description: Roll back an Amazon S3 bucket to a given point in time.
+
+Parameters:
+
+  BucketName:
+    Type: String
+    Description: The Amazon S3 bucket name to be rolled back to a point in time. Must have versioning enabled.
+    AllowedPattern: '.+'
+    ConstraintDescription: Bucket name must not be blank
+    Default: "bucket"
+
+  TimeStamp:
+    Type: String
+    Description: The date and time to roll back to in the UTC timezone, in ISO <yyyy-mm-ddThh:mm:ss> format. For example 2025-08-30T02:00:00.
+
+    AllowedPattern: '\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}((\+\d{2}:\d{2})|Z)?'
+    ConstraintDescription: Please enter a timestamp in ISO format, e.g. 2025-08-30T02:00:00
+    Default: "2025-08-30T02:00:00"
+
+  Prefix:
+    Type: String
+    Description: If you want to limit recovery to a specific prefix, specify it here. Leave blank to roll back the entire bucket. This value will be used to select from available S3 Inventories, and is required when there is no S3 Inventory of the whole bucket.
+    Default: ""
+  
+  StorageClass:
+    Type: String
+    Description: The S3 storage class to copy object versions into. If in doubt, use Intelligent-Tiering.
+    AllowedValues:
+      - STANDARD
+      - INTELLIGENT_TIERING
+      - STANDARD_IA
+      - GLACIER_IR
+      - GLACIER
+      - DEEP_ARCHIVE
+    ConstraintDescription: The S3 storage class to copy object versions into. As always with S3, if in doubt, use Intelligent-Tiering. See https://docs.aws.amazon.com/AmazonS3/latest/userguide/sc-howtoset.html for more information.
+    Default: "INTELLIGENT_TIERING"
+
+  KMSKey:
+    Type: String
+    Description:  If object versions should be created using a KMS encryption key, specify it here. Leave blank for SSE-S3. Permissions to KMS keys are not updated by this tool - see the documentation.
+    ConstraintDescription: Specify a valid KMS key ARN. If using SSE-S3, leave blank.
+    AllowedPattern: '(arn:.+:kms:.+:\d{12}:(key|alias)/.+)?'
+    Default: ""
+
+  StartS3BatchOperationsJobs:
+    Type: String
+    Description: The tool creates S3 Batch Operations jobs to revert changes, but by default it will not start the jobs. If you are working with a test dataset and do not need to validate the operations, change this to "YES".
+    AllowedValues:
+      - "YES"
+      - "NO"
+    ConstraintDescription: Please select YES or NO.
+    Default: "NO"
+
+  InventoryCSVLocation:
+    Type: String
+    Description: S3 URI of CSV inventory file(s) to use instead of S3 Inventory (e.g. s3://bucket/prefix/). Can be generated with https://github.com/aws-samples/sample-s3-listobjectversions-to-csv
+    AllowedPattern: '(s3://.+/)?'
+    ConstraintDescription: Please enter an S3 location ending in '/', e.g. s3://mybucket/prefix/
+    Default: ""
+
+  InventoryTableName:
+    Type: String
+    Description: Name of a pre-existing parquet-formatted inventory table in Athena.
+    Default: ""
+
+  DT:
+    Type: String
+    Description: dt= value for the pre-existing Athena table.
+    Default: ""
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "Amazon S3 rollback tool"
+        Parameters:
+          - BucketName
+          - TimeStamp
+          - Prefix
+          - StartS3BatchOperationsJobs
+      -        
+        Label:
+          default: "Optional parameters"
+        Parameters:
+          - StorageClass
+          - KMSKey
+          - InventoryCSVLocation
+      -
+        Label:
+          default: "Advanced parameters"
+        Parameters:
+          - InventoryTableName
+          - DT
+
+    ParameterLabels:
+        BucketName:
+          default: Bucket
+        Prefix:
+          default: Prefix
+        TimeStamp:
+          default: Timestamp
+        StorageClass:
+          default: Copy to storage class
+        KMSKey:
+          default: Copy using KMS key
+        StartS3BatchOperationsJobs:
+          default: Start S3 Batch Operations jobs
+        InventoryCSVLocation:
+          default: Specify CSV inventory
+        InventoryTableName:
+          default: Athena table name
+
+Conditions:
+  CreateInventory: !And
+    - !Equals [ !Ref InventoryTableName, "" ]
+    - !Equals [ !Ref InventoryCSVLocation, "" ]
+  
+  UseInventoryTable: !Not
+    - !Equals [ !Ref InventoryTableName, "" ]
+
+  UseInventoryCSV: !Not
+    - !Equals [ !Ref InventoryCSVLocation, "" ]
+    
+  CreateInventoryOrUseCSV: !Or
+    - !Condition CreateInventory
+    - !Condition UseInventoryCSV
+ 
+  WantKMS: !Not
+    - !Equals [ !Ref KMSKey, "" ]
+    
+Resources:
+
+  AthenaResultsBucket:
+    Type: "AWS::S3::Bucket"
+
+  GlueDatabase:
+    Type: "AWS::Glue::Database"
+    Properties:
+      CatalogId: !Ref "AWS::AccountId"
+      DatabaseInput:
+        Name: !Join [ "_", [ "s3_rollback_db", !Join [ "_", !Split [ "-", !Select [ 2, !Split [ "/", !Ref "AWS::StackId" ] ] ] ] ] ]
+        Description: !Sub "Holds the tables for the S3 Rollback solution in CloudFormation Stack '${AWS::StackName}'"
+        
+  GluePermissions:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt AthenaAccessRole.Arn
+      Resource:
+        Database:
+          CatalogId: !Ref "AWS::AccountId"
+          Name: !Ref GlueDatabase
+      Permissions:
+        - "CREATE_TABLE"
+      PermissionsWithGrantOption:
+        - "CREATE_TABLE"
+
+  AthenaWorkGroup:
+    Type: "AWS::Athena::WorkGroup"
+    Properties:
+      Name: !Join [ "_", [ "s3_rollback_wg", !Join [ "_", !Split [ "-", !Select [ 2, !Split [ "/", !Ref "AWS::StackId" ] ] ] ] ] ]
+      Description: !Sub "WorkGroup for the S3 Rollback '${AWS::StackName}' CloudFormation Stack"
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration: 
+        EnforceWorkGroupConfiguration: false 
+
+  ExecuteClean:
+    Type: "Custom::ExecuteCleanerFunction"
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt BucketCleaner.Arn
+      Bucket: !Ref AthenaResultsBucket
+
+  InventoryFinder:
+    Type: "AWS::Lambda::Function"
+    Condition: CreateInventory
+    Properties:
+      Runtime: python3.13
+      MemorySize: 1024
+      Timeout: 900
+      Handler: "index.handler"
+      Role: !GetAtt InventoryFinderRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import json
+          import re
+          import boto3
+          import botocore.exceptions
+          from datetime import datetime
+          from datetime import timezone
+          
+          def handler(event, context):
+          
+            if event["RequestType"] != "Create":
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              return
+            
+            fields = set(["LastModifiedDate", "StorageClass", "ETag", "ChecksumAlgorithm", "ObjectOwner"])
+            inv = response_data = None
+            invs = []
+            
+            bucket = event["ResourceProperties"]["Bucket"]
+            timestamp = datetime.fromisoformat(event["ResourceProperties"]["TimeStamp"])
+            if timestamp.tzinfo is None:
+              timestamp = timestamp.replace(tzinfo=timezone.utc)
+              
+            scope = event["ResourceProperties"]["Prefix"]
+            
+            session = boto3.Session()
+            s3 = session.client("s3")
+            
+            try:
+              response = s3.list_bucket_inventory_configurations(Bucket = bucket)
+            
+            except botocore.exceptions.ClientError as error:
+              
+              if error.response['Error']['Code'] == "NoSuchBucket":
+                reason = f"Bucket '{bucket}' does not exist."
+              
+              else:
+                reason = f"Error listing inventory configurations for bucket '{bucket}': {error.response['Error']['Message']}"
+              
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, None , False, reason)
+              return
+            
+            while True:
+            
+              bad_prefix = False
+              
+              for inv in response.get("InventoryConfigurationList", []):
+            
+                # We need an inventory in ORC / Parquet format, that has all object versions,
+                # contains the fields we're interested in, and meets the prefix scope the user asked for.
+                if (inv["Destination"]["S3BucketDestination"]["Format"] in ["ORC", "Parquet"] and
+                  inv["IncludedObjectVersions"] == "All" and fields.issubset(set(inv["OptionalFields"]))):
+                
+                  # Leading or trailing slashes in prefix used by Inventory breaks Athena.
+                  prefix = inv["Destination"]["S3BucketDestination"].get("Prefix", "")
+                  if prefix and (prefix[0] == "/" or prefix[-1] == "/"):
+                    bad_prefix = True
+                  else:
+                    invs.append(inv)
+            
+              if not response["IsTruncated"]:
+                break
+              
+              response = s3.list_bucket_inventory_configurations(Bucket = bucket,
+                ContinuationToken = response["NextContinuationToken"])
+            
+            # Now look through all the inventory configurations we found,
+            # and choose the most recent one.
+            
+            serde_map = {
+              "ORC": "org.apache.hadoop.hive.ql.io.orc.OrcSerde",
+              "Parquet" : "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"
+            }
+            
+            bad_scope = False
+            for inv in invs:
+              
+              d = inv["Destination"]["S3BucketDestination"]
+              inv_bucket = d["Bucket"].split(":")[5]
+              bucket_loc = f'{d["Prefix"]}/' if d.get("Prefix") else ""
+              prefix = f'{bucket_loc}{bucket}/{inv["Id"]}/hive/dt='
+              
+              filter = inv.get("Filter")
+              inv_scope = filter.get("Prefix") if filter and filter.get("Prefix") else ""
+              
+              # Does the prefix covered by the inventory report match what the user wants?
+              if not scope.startswith(inv_scope):
+                bad_scope = True
+                continue
+              
+              dates = list(boto3.resource("s3").Bucket(inv_bucket).objects.filter(Prefix = prefix))
+              if len(dates) == 0:
+                continue
+              
+              # Entries are sorted, so the last one is the most recent date.
+              result = re.search(r"dt=((\d{4}-\d{2}-\d{2})-(\d{2})-(\d{2}))", dates[-1].key)
+              
+              if (result):
+                ts = datetime.fromisoformat(f"{result.group(2)}T{result.group(3)}:{result.group(4)}:00Z")
+                
+                if ts >= timestamp:
+                
+                  response = s3.head_bucket(Bucket = inv_bucket)
+                  partition = session.get_partition_for_region(response["BucketRegion"])
+                  response_data = {
+                    "DateTime" : result.group(1),
+                    "InventoryLocation" : f"s3://{inv_bucket}/{prefix[:-3]}",
+                    "InventoryArn" : f"arn:{partition}:s3:::{inv_bucket}",
+                    "Serde" : serde_map[d["Format"]]
+                  }
+                  break
+            
+            if response_data is None:
+              reason = f"Couldn't find an inventory for bucket '{bucket}' in ORC / Parquet format, "\
+                          f"with fields {fields}, and inventory reports >= {timestamp}."
+              
+              if (bad_prefix):
+                reason += " At least one inventory was ignored because its destination prefix has a leading or trailing '/' character."
+              
+              if (bad_scope):
+                reason += " At least one inventory was ignored because its scope didn't include '{scope}."
+              
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, reason)
+              return
+            
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+  InventoryFinderRole:
+    Type: "AWS::IAM::Role"
+    Condition: CreateInventory
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "logs:CreateLogGroup"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action:
+                  - "s3:GetInventoryConfiguration"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${BucketName}"
+              - Effect: Allow
+                Action:
+                  - "s3:ListBucket"
+                Resource:
+                  - "*"
+
+  ExecuteInventoryFinder:
+    Type: "Custom::ExecuteInventoryFinderFunction"
+    Condition: CreateInventory
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt InventoryFinder.Arn
+      Bucket: !Ref BucketName
+      Prefix: !Ref Prefix
+      TimeStamp: !Ref TimeStamp
+      
+  CreatePITTable:
+    Type: "AWS::Athena::NamedQuery"
+    Condition: CreateInventory
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates an Amazon Athena table to hold an Amazon S3 Inventory"
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub
+        - |
+            -- Creates an Amazon Athena table to hold an Amazon S3 Inventory
+
+            CREATE EXTERNAL TABLE ${GlueDB}.pit_table(
+                     bucket string,
+                     key string,
+                     version_id string,
+                     is_latest boolean,
+                     is_delete_marker boolean,
+                     size bigint,
+                     last_modified_date timestamp,
+                     e_tag string,
+                     storage_class string,
+                     is_multipart_uploaded boolean,
+                     replication_status string,
+                     encryption_status string,
+                     object_lock_retain_until_date bigint,
+                     object_lock_mode string,
+                     object_lock_legal_hold_status string,
+                     intelligent_tiering_access_tier string,
+                     bucket_key_status string,
+                     checksum_algorithm string,
+                     object_access_control_list string,
+                     object_owner string
+            ) PARTITIONED BY (
+                    dt string
+            )
+            ROW FORMAT SERDE '${Serde}'
+              STORED AS INPUTFORMAT 'org.apache.hadoop.hive.ql.io.SymlinkTextInputFormat'
+              OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.IgnoreKeyTextOutputFormat'
+              LOCATION '${InventoryLocation}'
+              TBLPROPERTIES (
+                "projection.enabled" = "true",
+                "projection.dt.type" = "date",
+                "projection.dt.format" = "yyyy-MM-dd-HH-mm",
+                "projection.dt.range" = "2020-01-01-00-00,NOW",
+                "projection.dt.interval" = "1",
+                "projection.dt.interval.unit" = "HOURS"
+              );
+        - InventoryLocation: !GetAtt ExecuteInventoryFinder.InventoryLocation
+          GlueDB: !Ref GlueDatabase
+          Serde: !GetAtt ExecuteInventoryFinder.Serde
+
+  CreateCSVImportTable:
+    Type: "AWS::Athena::NamedQuery"
+    Condition: UseInventoryCSV
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Loads an inventory in CSV format into a temporary table"
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub
+        - |
+            -- Loads an inventory in CSV format into a temporary table
+
+            CREATE EXTERNAL TABLE ${GlueDB}.csv_import(
+                     bucket string,
+                     key string,
+                     version_id string,
+                     is_latest boolean,
+                     is_delete_marker boolean,
+                     size bigint,
+                     last_modified_date string,
+                     storage_class string,
+                     e_tag string
+            )
+            ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+            WITH SERDEPROPERTIES ("separatorChar" = ",", "quoteChar" = "\"")
+            LOCATION '${CSVLocation}'
+            TBLPROPERTIES ("skip.header.line.count"="1")
+
+        - CSVLocation: !Ref InventoryCSVLocation
+          GlueDB: !Ref GlueDatabase
+
+  CreateCSVPITTable:
+    Type: "AWS::Athena::NamedQuery"
+    Condition: UseInventoryCSV
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates the initial Point in Time table based on the CSV Import table"
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub
+        - |
+            -- Creates the initial Point in Time table based on the CSV Import table
+
+            CREATE TABLE ${GlueDB}.pit_table WITH (
+                format = 'ORC',
+                external_location = 's3://${ResultsBucket}/Tables/pit_table/',
+                write_compression = 'SNAPPY'
+            ) AS
+            SELECT
+                bucket,
+                url_decode(key) key,
+                version_id,
+                is_delete_marker,
+                is_latest,
+                cast(from_iso8601_timestamp(last_modified_date) as TIMESTAMP) last_modified_date,
+                size,
+                storage_class,
+                cast(null as varchar) intelligent_tiering_access_tier,
+                '' dt
+            FROM
+                ${GlueDB}.csv_import
+
+        - GlueDB: !Ref GlueDatabase
+          ResultsBucket: !Ref AthenaResultsBucket
+
+  CreateAllVersionsTable:
+    Type: "AWS::Athena::NamedQuery"
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates an Amazon Athena table to hold an Amazon S3 Inventory from a single dt= prefix"
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub
+        - |
+            -- Creates an Amazon Athena table to hold an Amazon S3 Inventory from a single dt= prefix.
+            -- Takes a single partition, tidies up date, filters by prefix if any
+            -- The dt= should be most recent date, so we have visibility into all changes.
+
+            CREATE TABLE ${GlueDB}.all_versions WITH (
+                format = 'ORC',
+                external_location = 's3://${ResultsBucket}/Tables/all_versions_table/',
+                write_compression = 'SNAPPY'
+            ) AS
+            SELECT
+                key,
+                version_id,
+                is_delete_marker,
+                is_latest,
+                last_modified_date,
+                size,
+                storage_class,
+                intelligent_tiering_access_tier
+            FROM
+                ${SourceDB}.${PITTable}
+            WHERE
+                dt = '${DateTime}' and
+                starts_with(key, '${Prefix}') and
+                bucket = '${SourceBucket}'
+                
+        - DateTime: !If [ CreateInventory, !GetAtt ExecuteInventoryFinder.DateTime, !If [ UseInventoryCSV, "", !Ref DT ] ]
+          GlueDB: !Ref GlueDatabase
+          PITTable: !If [ CreateInventoryOrUseCSV, "pit_table", !Ref InventoryTableName ]
+          ResultsBucket: !Ref AthenaResultsBucket
+          SourceDB: !If [ CreateInventoryOrUseCSV, !Ref GlueDatabase, "default" ]
+          SourceBucket: !Ref BucketName
+          Prefix: !Ref Prefix
+
+  CreateAllKeysTable:
+    Type: "AWS::Athena::NamedQuery"
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates an Amazon Athena table to hold the distinct list of keys"
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub
+        - |
+            -- Creates "All Keys" table, which holds the distinct list of keys.
+
+            CREATE TABLE ${GlueDB}.all_keys WITH (
+                format = 'ORC',
+                external_location = 's3://${ResultsBucket}/Tables/all_keys_table/',
+                write_compression = 'SNAPPY'
+            ) as
+            select distinct
+                key,
+            from
+                ${GlueDB}.all_versions
+    
+        - ResultsBucket: !Ref AthenaResultsBucket
+          GlueDB: !Ref GlueDatabase
+
+  CreateLatestVersionsTable:
+    Type: "AWS::Athena::NamedQuery"
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates an Amazon Athena table to hold the latest versions of every file under the prefix"
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub
+        - |
+            -- Creates "Latest Versions" table, which holds the list of most recent versions.
+            -- This will exclude unchanged keys, i.e. ones where the latest version is before the point in time.
+
+            CREATE TABLE ${GlueDB}.latest_versions WITH (
+                format = 'ORC',
+                external_location = 's3://${ResultsBucket}/Tables/latest_versions_table/',
+                write_compression = 'SNAPPY'
+            ) as
+            select
+                key,
+                version_id,
+                is_delete_marker,
+                size,
+                storage_class
+            from
+                ${GlueDB}.all_versions
+            where
+                is_latest = true
+                and last_modified_date > from_iso8601_timestamp('${TimeStamp}')
+    
+        - ResultsBucket: !Ref AthenaResultsBucket
+          TimeStamp: !Ref TimeStamp
+          GlueDB: !Ref GlueDatabase
+
+  CreateDesiredTable:
+    Type: "AWS::Athena::NamedQuery"
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates an Amazon Athena table to hold the desired version / delete markers of every file under the prefix"
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub
+        - |
+            -- Create "Desired", which holds the list of versions / delete markers immediately before the point in time.
+
+            CREATE TABLE ${GlueDB}.desired WITH (
+                format = 'ORC',
+                external_location = 's3://${ResultsBucket}/Tables/desired_table/',
+                write_compression = 'SNAPPY'
+            ) as
+            select
+                key,
+                max_by(version_id, last_modified_date) as version_id,
+                max_by(last_modified_date, last_modified_date) as last_modified_date,
+                max_by(is_delete_marker, last_modified_date) as is_delete_marker,
+                max_by(is_latest, last_modified_date) as is_latest,
+                max_by(size, last_modified_date) as size,
+                max_by(storage_class, last_modified_date) as storage_class,
+                max_by(intelligent_tiering_access_tier, last_modified_date) as intelligent_tiering_access_tier
+            from
+                ${GlueDB}.all_versions
+            where
+                last_modified_date <= from_iso8601_timestamp('${TimeStamp}')
+            group by
+                key    
+                
+        - ResultsBucket: !Ref AthenaResultsBucket
+          TimeStamp: !Ref TimeStamp
+          GlueDB: !Ref GlueDatabase
+
+  CreateDesiredVersionsTable:
+    Type: "AWS::Athena::NamedQuery"
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates an Amazon Athena table to hold the desired versions of every file under the prefix"
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub
+        - |
+            -- Create "Desired Versions", which holds the list of versions immediately before the point in time.
+
+            CREATE TABLE ${GlueDB}.desired_versions WITH (
+                format = 'ORC',
+                external_location = 's3://${ResultsBucket}/Tables/desired_versions_table/',
+                write_compression = 'SNAPPY'
+            ) as
+            select
+                *
+            from
+                ${GlueDB}.desired
+            where
+                is_delete_marker = false
+                
+        - ResultsBucket: !Ref AthenaResultsBucket
+          TimeStamp: !Ref TimeStamp
+          GlueDB: !Ref GlueDatabase
+
+  CreateChangedKeysTable:
+    Type: "AWS::Athena::NamedQuery"
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates an Athena table to hold the list of keys that have changed"
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub
+        - |
+            -- Creates an Athena table to hold the list of keys that have changed
+            -- For each Desired Version ID, shows Latest Version ID, delete marker status,
+            -- Desired size, Desired storage class (to help determine how best to restore)
+
+            CREATE TABLE ${GlueDB}.changed_keys WITH (
+                format = 'ORC',
+                external_location = 's3://${ResultsBucket}/Tables/changed_keys_table/',
+                write_compression = 'SNAPPY'
+            ) as
+            select
+                d.key as key,
+                d.version_id as desired_version_id,
+                l.version_id as latest_version_id,
+                d.is_delete_marker as desired_is_delete_marker,
+                l.is_delete_marker as latest_is_delete_marker,
+                d.size as size,
+                d.storage_class as storage_class,
+                coalesce(d.intelligent_tiering_access_tier, '') as intelligent_tiering_access_tier
+            from ${GlueDB}.desired_versions d
+            inner join ${GlueDB}.latest_versions l on
+                d.key = l.key
+        
+        - ResultsBucket: !Ref AthenaResultsBucket
+          GlueDB: !Ref GlueDatabase
+
+  CreateCountVersionsTable:
+    Type: "AWS::Athena::NamedQuery"
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates an Athena table to count an object's versions"
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub
+        - |
+            -- Creates an Athena table to count an object's Versions
+            -- For all keys created after the Point In Time, return key and count of non Delete Marker versions.
+            
+            CREATE TABLE ${GlueDB}.count_versions WITH (
+                format = 'ORC',
+                external_location = 's3://${ResultsBucket}/Tables/count_versions_table/',
+                write_compression = 'SNAPPY'
+            ) as
+            select
+                l.key as key,
+                sum(IF((a.is_delete_marker = true), 0, 1)) count_versions
+            from
+                ${GlueDB}.latest_versions l
+            inner join
+                ${GlueDB}.all_versions a on l.key = a.key
+            inner join
+                ${GlueDB}.desired_versions d on l.key = d.key
+            where
+                a.last_modified_date > from_iso8601_timestamp('${TimeStamp}')
+            group by
+                l.key
+            
+        - ResultsBucket: !Ref AthenaResultsBucket
+          TimeStamp: !Ref TimeStamp
+          GlueDB: !Ref GlueDatabase
+
+  CreateScenario1Table:
+    Type: "AWS::Athena::NamedQuery"
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates an Athena table to address Scenario 1"
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub
+        - |
+            -- Creates an Athena table to address Scenario 1;
+            -- Add delete markers where (all version of key have last_modified after Point In Time,
+            -- or current version at Point In Time was a delete marker) and current version is not a delete marker
+
+            CREATE TABLE ${GlueDB}.scenario1_keys WITH (
+                format = 'TEXTFILE',
+                field_delimiter = ',',
+                write_compression = 'NONE',
+                external_location = 's3://${ResultsBucket}/Tables/scenario1_keys_table/'
+            ) as
+            
+            select
+                '${Bucket}' as bucket,
+                url_encode(s.key) as key
+            from (
+                
+                select -- Keys where all versions are after the Point In Time
+                    key
+                from
+                    ${GlueDB}.all_versions
+                group by
+                    key
+                having
+                    min(last_modified_date) > from_iso8601_timestamp('${TimeStamp}')
+            
+                union
+            
+                select -- Keys where the desired version is a delete_marker
+                    key
+                from
+                    ${GlueDB}.desired
+                where
+                    is_delete_marker = true
+            ) s
+            
+            left join
+                ${GlueDB}.latest_versions l
+            on
+                s.key = l.key
+            
+            where
+                l.is_delete_marker <> true -- can be false, or null
+ 
+        - GlueDB: !Ref GlueDatabase
+          TimeStamp: !Ref TimeStamp
+          ResultsBucket: !Ref AthenaResultsBucket
+          Bucket: !Ref BucketName
+
+  CreateScenario2Table:
+    Type: "AWS::Athena::NamedQuery"
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates an Athena table to address Scenario 2"
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub
+        - |
+            -- Creates an Athena table to address Scenario 2;
+            -- Keys where there are only delete markers (no new objects) after the point in time.
+
+            CREATE TABLE ${GlueDB}.scenario2_keys WITH (
+                format = 'TEXTFILE',
+                field_delimiter = ',',
+                write_compression = 'NONE',
+                external_location = 's3://${ResultsBucket}/Tables/scenario2_keys_table/'
+            ) as
+            select
+                '${Bucket}' as bucket,
+                url_encode(a.key) as key,
+                a.version_id as version_id
+            from
+                ${GlueDB}.count_versions c
+            right join
+                ${GlueDB}.all_versions a
+            on
+                c.key = a.key
+            -- Only take keys that only have delete markers after the point in time.
+            where
+                c.count_versions = 0 and
+                a.last_modified_date > from_iso8601_timestamp('${TimeStamp}')
+            
+        - GlueDB: !Ref GlueDatabase
+          TimeStamp: !Ref TimeStamp
+          ResultsBucket: !Ref AthenaResultsBucket
+          Bucket: !Ref BucketName
+
+  CreateScenario3aTable:
+    Type: "AWS::Athena::NamedQuery"
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates an Athena table to address Scenario 3a"
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub
+        - |
+            -- Creates an Athena table to address Scenario 3a;
+            -- VersionID from PIT is in GFR/GDA class. Need to restore from async.
+
+            CREATE TABLE ${GlueDB}.scenario3a_keys WITH (
+                format = 'TEXTFILE',
+                field_delimiter = ',',
+                write_compression = 'NONE',
+                external_location = 's3://${ResultsBucket}/Tables/scenario3a_keys_table/'
+            ) as
+                select
+                    '${Bucket}' as bucket,
+                    url_encode(ck.key) as key,
+                    ck.desired_version_id as version_id
+                from (
+                    ${GlueDB}.changed_keys ck
+                    inner join ${GlueDB}.count_versions cv ON cv.key = ck.key
+                )
+
+            where
+                (
+                    ck.storage_class in('GLACIER', 'DEEP_ARCHIVE') or
+                    ck.intelligent_tiering_access_tier in ('ARCHIVE', 'DEEP_ARCHIVE')
+                ) and
+                    cv.count_versions > 0
+
+        - GlueDB: !Ref GlueDatabase
+          ResultsBucket: !Ref AthenaResultsBucket
+          Bucket: !Ref BucketName
+
+  CreateScenario3bTable:
+    Type: "AWS::Athena::NamedQuery"
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates an Athena table to address Scenario 3b"
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub
+        - |
+            -- Creates an Athena table to address Scenario 3b;
+            -- Objects with VersionID newer than at PIT, not covered by Scenario 2, and <= 5GB
+
+            CREATE TABLE ${GlueDB}.scenario3b_keys WITH (
+                format = 'TEXTFILE',
+                field_delimiter = ',',
+                write_compression = 'NONE',
+                external_location = 's3://${ResultsBucket}/Tables/scenario3b_keys_table/'
+            ) as
+                select
+                    '${Bucket}' as bucket,
+                    url_encode(ck.key) as key,
+                    ck.desired_version_id as version_id
+                from (
+                    ${GlueDB}.changed_keys ck
+                    inner join ${GlueDB}.count_versions cv ON cv.key = ck.key
+                )
+
+            where
+                ck.size <= parse_data_size('5GB') and
+                ck.storage_class not in('GLACIER', 'DEEP_ARCHIVE') and
+                ck.intelligent_tiering_access_tier not in ('ARCHIVE', 'DEEP_ARCHIVE') and
+                cv.count_versions > 0
+
+        - GlueDB: !Ref GlueDatabase
+          ResultsBucket: !Ref AthenaResultsBucket
+          Bucket: !Ref BucketName
+
+  CreateScenario3cTable:
+    Type: "AWS::Athena::NamedQuery"
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates an Athena table to address Scenario 3c"
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub
+        - |
+            -- Creates an Athena table to address Scenario 3c;
+            -- Objects with VersionID newer than at PIT, not covered by Scenario 2, and > 5GB
+
+            CREATE TABLE ${GlueDB}.scenario3c_keys WITH (
+                format = 'TEXTFILE',
+                field_delimiter = ',',
+                write_compression = 'NONE',
+                external_location = 's3://${ResultsBucket}/Tables/scenario3c_keys_table/'
+            ) as
+                select
+                    '${Bucket}' as bucket,
+                    url_encode(ck.key) as key,
+                    ck.desired_version_id as version_id
+                from (
+                    ${GlueDB}.changed_keys ck
+                    inner join ${GlueDB}.count_versions cv ON cv.key = ck.key
+                )
+
+            where
+                ck.size > parse_data_size('5GB') and
+                ck.storage_class not in('GLACIER', 'DEEP_ARCHIVE') and
+                ck.intelligent_tiering_access_tier not in ('ARCHIVE', 'DEEP_ARCHIVE') and
+                cv.count_versions > 0
+
+        - GlueDB: !Ref GlueDatabase
+          ResultsBucket: !Ref AthenaResultsBucket
+          Bucket: !Ref BucketName
+
+  ManifestMaker:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Runtime: python3.13
+      MemorySize: 1024
+      Timeout: 900
+      Handler: "index.handler"
+      Role: !GetAtt ManifestMakerRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import concurrent.futures
+          import time
+          import json
+          import uuid
+          import boto3
+          import boto3.session
+          import botocore
+          import botocore.config
+          
+          # Takes a list of S3 keys and combines them into files of >= 5MB. Deletes the old keys.
+          def combine(s3, bucket, prefix, keys):
+          
+              # Special case. Only received 1 file? Just return it unchanged.
+              if len(keys) == 1:
+                  return keys
+              
+              buffer = bytearray()
+              key_count = 0
+              new_names = []
+              
+              for k in keys:
+                  
+                  key_count += 1
+                  response = s3.get_object(Bucket = bucket, Key = k)
+                  buffer.extend(response["Body"].read())
+                  
+                  # Have we collected more than 5MB?
+                  if len(buffer) >= 5*1024*1024:
+                      new_names += [ write_object(s3, bucket, prefix, buffer) ]
+                      buffer = bytearray() # Empty the buffer
+                      key_count = 0
+                  
+              # One file left, just return it intact.
+              if key_count == 1:
+                  new_names += [ k ]
+              
+              # Multiple files left in buffer. Combine them.
+              elif key_count > 1:
+                  new_names += [ write_object(s3, bucket, prefix, buffer) ]
+              
+              return new_names
+          
+          # Writes an object with a new, random name.
+          def write_object(s3, bucket, prefix, bytes):
+            
+              name = f"{prefix}{uuid.uuid4()}-{time.time()}.csv" # Random name.
+              response = s3.put_object(Bucket = bucket, Key = name, Body = bytes)
+              
+              return name
+          
+          def handler(event, context):
+            
+              # Only execute on create.
+              if event["RequestType"] != "Create":
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              
+              bucket = event["ResourceProperties"]["SourceBucket"]
+              table_src = event["ResourceProperties"]["TableSource"]
+              manifest_dst = event["ResourceProperties"]["ManifestDestination"]
+              
+              session = boto3.session.Session()
+              s3 = session.client("s3")
+              
+              for t in event["ResourceProperties"]["Tables"]:
+              
+                  dst_key = f"{manifest_dst}{t}.csv"
+                  prefix = f"{table_src}{t}_keys_table/"
+                  src_keys = []
+                  combine_keys = []
+                  found = False
+                  
+                  for p in s3.get_paginator("list_objects_v2").paginate(Bucket = bucket, Prefix = prefix):
+                      
+                      for c in p.get("Contents", []):
+                          
+                          found = True
+                          if c["Size"] < 5*1024*1024:
+                              combine_keys += [ c["Key"] ]
+                          else:
+                              src_keys += [ c["Key"] ]
+                      
+                  if found:
+                      
+                      try:
+                          
+                          # Combine any parts < 5MB into objects of at least 5MB.    
+                          src_keys += combine(s3, bucket, "tmp/", combine_keys)
+                          
+                          # Create a new S3 client, but this time with enough pooled connections
+                          # to upload all parts in parallel.
+                          config = botocore.config.Config(max_pool_connections = int(len(src_keys)))
+                          s3 = session.client("s3", config = config)
+                          
+                          response = s3.create_multipart_upload(
+                              Bucket = bucket,
+                              Key = dst_key
+                          )
+                          
+                          upload_id = response["UploadId"]
+                          
+                          # Create a separate thread for each part being uploaded.
+                          part = 1
+                          futures = []
+                          executor = concurrent.futures.ThreadPoolExecutor(max_workers = len(src_keys))
+                          for key in src_keys:
+                              futures += [ executor.submit(upload_part, s3, bucket, dst_key, { "Bucket" : bucket, "Key" : key } , part, upload_id) ]
+                              part += 1
+                          
+                          parts = []
+                          for r in concurrent.futures.as_completed(futures):
+                              parts += [ r.result() ]
+                          
+                          executor.shutdown()
+                          
+                          parts.sort(key = lambda e: e["PartNumber"])
+                          
+                          response = s3.complete_multipart_upload(
+                              Bucket = bucket,
+                              Key = dst_key,
+                              MultipartUpload = { "Parts" : parts },
+                              UploadId = upload_id
+                          )
+                          
+                          waiter = s3.get_waiter('object_exists')
+                          waiter.wait(
+                              Bucket = bucket,
+                              Key = dst_key,
+                              WaiterConfig = { 'Delay' : 10, 'MaxAttempts' : 60 }
+                          )
+                      
+                      except botocore.exceptions.ClientError as e:
+                          reason = f'S3 processing failed for table {t} with {e.response["Error"]["Code"]}: {e.response["Error"]["Message"]}'
+                          cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, reason)
+                      
+                      except botocore.exceptions.WaiterError as e:
+                          reason = f'Generating manifest for table {t} still not complete.'
+                          cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, reason)
+                  
+                  else:
+                      print(f"No source files found for table {t}.")
+                  
+              response_data = { "Manifests" : f"s3://{bucket}/{manifest_dst}" }
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+          
+          def upload_part(s3, bucket, key, src, part, upload_id):
+            
+            response = s3.upload_part_copy(
+                Bucket = bucket,
+                Key = key,
+                CopySource = src,
+                PartNumber = part,
+                UploadId = upload_id
+            )
+            
+            return { "ETag" : response["CopyPartResult"]["ETag"], "PartNumber" : part }
+  
+  ManifestMakerRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "logs:CreateLogGroup"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action:
+                  - "s3:ListBucket"
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                Resource:
+                  - !GetAtt AthenaResultsBucket.Arn
+                  - !Sub "${AthenaResultsBucket.Arn}/*"
+                  
+  BucketCleaner:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Runtime: python3.13
+      MemorySize: 1024
+      Timeout: 900
+      Handler: "index.handler"
+      Role: !GetAtt BucketCleanerRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import boto3
+            
+          def handler(event, context):
+            
+            if event["RequestType"] != "Delete":
+              status = {
+                "Status" : f'Exiting on RequestType = {event["RequestType"]}',
+                "Event" : event
+              }
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, status)
+              return
+            
+            bucket = event["ResourceProperties"]["Bucket"]
+            s3 = boto3.client("s3")
+            
+            try:
+              response = s3.head_bucket(Bucket = bucket)
+            except Exception as e:
+              status = {
+                "Status" : f'Exiting due to error = {e}',
+                "Event" : event
+              }
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, status)
+              return
+            
+            count = 0
+            total = 0
+            
+            for p in s3.get_paginator('list_objects_v2').paginate(Bucket = bucket):
+            
+              keys = [ {"Key" : c["Key"] } for c in p.get("Contents", []) ]
+                
+              if keys:
+                total += len(keys)                
+                response = s3.delete_objects(Bucket = bucket, Delete = { "Objects" : keys })
+                count += len(response.get("Deleted", []))
+                
+            status = { "Status" : f'Deleted {count} / {total} keys.' }
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, status)
+
+  BucketCleanerRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "logs:CreateLogGroup"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action:
+                  - "s3:ListBucket"
+                  - "s3:DeleteObject"
+                Resource:
+                  - !GetAtt AthenaResultsBucket.Arn
+                  - !Sub "${AthenaResultsBucket.Arn}/*"
+                  
+  QueryExecutor:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Runtime: python3.13
+      MemorySize: 1024
+      Timeout: 900
+      Handler: "index.handler"
+      Role: !GetAtt AthenaAccessRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import json
+          import time
+          import boto3
+          import re
+          
+          def handler(event, context):
+          
+              # Only execute on create.
+              if event["RequestType"] != "Create":
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+                  
+              query_id = event["ResourceProperties"]["QueryID"]
+              
+              # Where to place the results
+              results_location = event["ResourceProperties"]["ResultsLocation"]
+              
+              workgroup = event["ResourceProperties"]["WorkGroup"]
+              
+              s3 = boto3.client("s3")
+              athena = boto3.client("athena")
+              
+              query = athena.get_named_query(NamedQueryId = query_id)
+              
+              try:
+                response = athena.start_query_execution(
+                    QueryString = query["NamedQuery"]["QueryString"],
+                    ResultConfiguration = { "OutputLocation" : results_location },
+                    WorkGroup = workgroup
+                )
+              
+                execution_id = response["QueryExecutionId"]
+                response = athena.get_query_execution(QueryExecutionId = execution_id)
+              
+                # Wait for query to finish.
+                while response["QueryExecution"]["Status"]["State"] in ["QUEUED", "RUNNING"]:
+                  
+                    time.sleep(5)
+                    response = athena.get_query_execution(QueryExecutionId = execution_id)
+              
+                (bucket, prefix) = results_location[5:].split("/", 1)
+              
+                # Remove metadata files so we just have CSVs to import.
+                print(f"Paginating s3://{bucket}/{prefix}")
+                for p in s3.get_paginator("list_objects_v2").paginate(Bucket = bucket, Prefix = prefix):
+                    for c in p.get("Contents", []):
+                      
+                        if c["Key"].endswith(".metadata"):
+                            r = s3.delete_object(Bucket = bucket, Key = c["Key"])
+              
+                if response["QueryExecution"]["Status"]["State"] == "SUCCEEDED":
+                  
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, {"State" : "SUCCEEDED"})
+              
+                else:
+                    reason = str(response["QueryExecution"]["Status"]["AthenaError"])
+                    cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, reason)
+              
+              except Exception as e:
+                cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, f"Caught exception: {e}")
+          
+  AthenaAccessRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "logs:CreateLogGroup"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action:
+                  - "athena:GetNamedQuery"
+                  - "athena:StartQueryExecution"
+                  - "athena:GetQueryExecution"
+                  - "athena:GetQueryResults"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AthenaWorkGroup}"
+              - Effect: Allow
+                Action:
+                  - "glue:CreateDatabase"
+                  - "glue:CreateTable"
+                  - "glue:GetTable"
+                  - "glue:GetDatabase"
+                  - "glue:GetPartition"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/*"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/*"
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                Resource:
+                  - !Sub "${AthenaResultsBucket.Arn}/*"
+                  - !If [ CreateInventory, !Sub "${ExecuteInventoryFinder.InventoryArn}/*", !Ref "AWS::NoValue" ]
+                  - !If [ UseInventoryCSV, !Join [ "", [ !Sub "arn:${AWS::Partition}:s3:::", !Select [ 1, !Split [ "s3://", !Ref InventoryCSVLocation ] ], "*" ] ], !Ref "AWS::NoValue" ]
+              - Effect: Allow
+                Action:
+                  - "s3:ListBucket"
+                Resource:
+                  - !GetAtt AthenaResultsBucket.Arn
+                  - !If [ CreateInventory, !GetAtt ExecuteInventoryFinder.InventoryArn, !Ref "AWS::NoValue" ]
+                  - !If [ UseInventoryCSV, !Join [ "", [ !Sub "arn:${AWS::Partition}:s3:::", !Select [ 2, !Split [ "/", !Ref InventoryCSVLocation ] ] ] ], !Ref "AWS::NoValue" ]
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                  - "s3:DeleteObject"
+                Resource:
+                  - !Sub "${AthenaResultsBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - "s3:GetBucketLocation"
+                Resource:
+                  - !GetAtt AthenaResultsBucket.Arn
+        
+  ExecuteCreatePITTable:
+    Type: "Custom::ExecuteCreatePITTableFunction"
+    Condition: CreateInventory
+    DependsOn:
+    - ExecuteClean
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreatePITTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreatePITTable/"
+
+  ExecuteCreateCSVImportTable:
+    Type: "Custom::ExecuteCreateCSVImportTableFunction"
+    Condition: UseInventoryCSV
+    DependsOn:
+    - ExecuteClean
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateCSVImportTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateCSVImportTable/"
+
+  ExecuteCreateCSVPITTable:
+    Type: "Custom::ExecuteCreateCSVPITTableFunction"
+    Condition: UseInventoryCSV
+    DependsOn:
+    - ExecuteCreateCSVImportTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateCSVPITTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateCSVPITTable/"
+
+  ExecuteCreateAllVersionsTable:
+    Type: "Custom::ExecuteCreateAllVersionsTableFunction"
+    DependsOn:
+    - ExecuteClean
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateAllVersionsTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateAllVersionsTable/"
+      Dependency: !If
+        - CreateInventory
+        - !GetAtt ExecuteCreatePITTable.State
+        - !If
+          - UseInventoryCSV
+          - !GetAtt ExecuteCreateCSVPITTable.State
+          - !Ref AWS::NoValue
+
+  ExecuteCreateLatestVersionsTable:
+    Type: "Custom::ExecuteCreateLatestVersionsTableFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateAllVersionsTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateLatestVersionsTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateLatestVersionsTable/"
+
+  ExecuteCreateDesiredTable:
+    Type: "Custom::ExecuteCreateDesiredTableFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateAllVersionsTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateDesiredTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateDesiredTable/"
+
+  ExecuteCreateDesiredVersionsTable:
+    Type: "Custom::ExecuteCreateDesiredVersionsTableFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateDesiredTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateDesiredVersionsTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateDesiredVersionsTable/"
+
+  ExecuteCreateChangedKeysTable:
+    Type: "Custom::ExecuteCreateChangedKeysTableFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateDesiredVersionsTable
+    - ExecuteCreateLatestVersionsTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateChangedKeysTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateChangedKeysTable/"
+
+  ExecuteCreateCountVersionsTable:
+    Type: "Custom::ExecuteCreateCountVersionsTableFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateAllVersionsTable
+    - ExecuteCreateDesiredVersionsTable
+    - ExecuteCreateLatestVersionsTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateCountVersionsTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateCountVersionsTable/"
+
+  ExecuteCreateScenario1Table:
+    Type: "Custom::ExecuteCreateScenario1TableFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateAllVersionsTable
+    - ExecuteCreateLatestVersionsTable
+    - ExecuteCreateDesiredTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateScenario1Table.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario1Table/"
+
+  ExecuteCreateScenario2Table:
+    Type: "Custom::ExecuteCreateScenario2TableFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateCountVersionsTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateScenario2Table.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario2Table/"
+
+  ExecuteCreateScenario3aTable:
+    Type: "Custom::ExecuteCreateScenario3aTableFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateChangedKeysTable
+    - ExecuteCreateCountVersionsTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateScenario3aTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario3aTable/"
+
+  ExecuteCreateScenario3bTable:
+    Type: "Custom::ExecuteCreateScenario3bTableFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateChangedKeysTable
+    - ExecuteCreateCountVersionsTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateScenario3bTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario3bTable/"
+
+  ExecuteCreateScenario3cTable:
+    Type: "Custom::ExecuteCreateScenario3cViewTable"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateChangedKeysTable
+    - ExecuteCreateCountVersionsTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateScenario3cTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario3cTable/"
+
+  ExecuteManifestMaker:
+    Type: "Custom::ExecuteManifestMakerFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateScenario1Table
+    - ExecuteCreateScenario2Table
+    - ExecuteCreateScenario3aTable
+    - ExecuteCreateScenario3bTable
+    - ExecuteCreateScenario3cTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt ManifestMaker.Arn
+      SourceBucket: !Ref AthenaResultsBucket
+      TableSource: Tables/
+      ManifestDestination: Manifests/
+      Tables:
+        - scenario1
+        - scenario2
+        - scenario3a
+        - scenario3b
+        - scenario3c
+
+  S3BatchOpsCreator:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Runtime: python3.13
+      MemorySize: 1024
+      Timeout: 60
+      Handler: "index.handler"
+      Role: !GetAtt S3BatchOpsCreatorRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import boto3
+          import json
+          import botocore
+          import os
+          
+          def handler(event, context):
+          
+              #
+              # Delete any existing S3 Batch Operations jobs on stack delete.
+              #
+              if event["RequestType"] == "Delete":
+                  
+                  job_id = event['PhysicalResourceId']
+                  if job_id == "NO_JOB":
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  try:
+                      sts = boto3.client("sts")
+                      account_id = sts.get_caller_identity()["Account"]
+                      
+                      s3control = boto3.client("s3control")
+                      response = s3control.update_job_status(
+                          AccountId = account_id,
+                          JobId = job_id,
+                          RequestedJobStatus= "Cancelled",
+                          StatusUpdateReason = f"Cancelling job due to deletion of CloudFormation Stack '{event['StackId']}'"
+                      )
+                  
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+              
+                  except botocore.exceptions.ClientError as e:
+                  
+                      print(f"Warning: couldn't delete job '{event['PhysicalResourceId']}': {e}")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+              
+              #
+              # Update. Do nothing.
+              #
+              if event["RequestType"] == "Update":
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              
+              #
+              # Create job.
+              #
+              # Location of the manifest file.
+              manifest_bucket = event["ResourceProperties"]["ManifestBucket"]
+              manifest_key = event["ResourceProperties"]["ManifestKey"]
+              manifest_arn = f"arn:aws:s3:::{manifest_bucket}/{manifest_key}"
+              
+              # Manifest fields.
+              fields = ["Bucket", "Key"]
+              if event["ResourceProperties"].get("HasVersionIds"):
+                  fields.append("VersionId")
+              
+              # Where to put report
+              report_bucket = event["ResourceProperties"]["ReportBucket"]
+              report_prefix = event["ResourceProperties"]["ReportPrefix"]
+              
+              # Description of job
+              description = event["ResourceProperties"]["Description"]
+              
+              # Location to which files should be copied
+              target_bucket = event["ResourceProperties"].get("TargetBucket")
+              
+              # Role for S3 Batch Operations to use
+              role_arn = event["ResourceProperties"]["S3BatchOpsRoleArn"]
+              
+              # Generate unique client request token, max 64 characters.
+              token = event["StackId"].split("/")[2] + event["RequestId"]
+              token = token.replace("-", "")[0:64]
+              
+              # What storage class to use for the copy
+              storage_class = event["ResourceProperties"].get("StorageClass", "")
+              
+              # What function to use for Lambda copy jobs
+              function_arn = event["ResourceProperties"].get("FunctionArn")
+              
+              # What KMS key to use for encryption when copying objects
+              kms_key = event["ResourceProperties"].get("KMSKey")
+              
+              # Should we start the job automatically?
+              start_job = event["ResourceProperties"].get("StartJob", "NO") == "YES"
+              
+              try:
+                  sts = boto3.client("sts")
+                  account_id = sts.get_caller_identity()["Account"]
+          
+                  # Find the eTag for the manifest
+                  s3 = boto3.client("s3")
+                  response = s3.head_object(
+                      Bucket = manifest_bucket,
+                      Key = manifest_key
+                  )
+                  
+                  # Remove open and closing quote marks on eTag
+                  etag = response["ETag"][1:-1]
+              
+                  # Create the S3 Batch Operations job
+                  s3control = boto3.client("s3control")
+                  
+                  kwargs = {
+                      "AccountId" : account_id,
+                      "ConfirmationRequired" : not start_job,
+                      "Report" : {
+                          "Bucket": report_bucket,
+                          "Prefix": report_prefix,
+                          "Format": "Report_CSV_20180820",
+                          "Enabled": True,
+                          "ReportScope": "AllTasks"
+                      },
+                      "ClientRequestToken" : token,
+                      "Manifest" : {
+                          "Location": {
+                              "ObjectArn": manifest_arn,
+                              "ETag": etag
+                          },
+                          "Spec": {
+                              "Format": "S3BatchOperations_CSV_20180820",
+                              "Fields": fields
+                          }
+                      },
+                      "Priority" : 1,
+                      "RoleArn" : role_arn,
+                      "Description" : f"S3 Point in Time Rollback - {description} - for CloudFormation Stack '{event['StackId']}'"
+                  }
+                  
+                  if target_bucket: # A Copy job
+                      kwargs["Operation"] = {
+                          "S3PutObjectCopy": {
+                              "TargetResource": f"arn:aws:s3:::{target_bucket}",
+                              "MetadataDirective": "COPY",
+                              "StorageClass": storage_class,
+                              "CannedAccessControlList": "bucket-owner-full-control"
+                          }
+                      }
+                      
+                      if kms_key: # Want KMS encryption
+                          kwargs["Operation"]["S3PutObjectCopy"]["SSEAwsKmsKeyId"] = kms_key
+                          kwargs["Operation"]["S3PutObjectCopy"]["NewObjectMetadata"] = { "SSEAlgorithm" : "KMS" }
+                  
+                  else: # A Lambda job (either Delete, or >5GB Copy job)
+                      kwargs["Operation"] = {
+                          "LambdaInvoke": {
+                              "FunctionArn": function_arn,
+                              "InvocationSchemaVersion" : "2.0",
+                              "UserArguments" : {
+                                  "StorageClass" : storage_class,
+                              }
+                          }
+                      }
+                      
+                      if kms_key: # Want KMS encryption
+                          kwargs["Operation"]["LambdaInvoke"]["UserArguments"]["KMSKey"] = kms_key
+                
+                  response = s3control.create_job(**kwargs)
+                  
+                  url = f"https://{os.environ['AWS_REGION']}.console.aws.amazon.com/s3/jobs/{response['JobId']}"
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, { "Output": url}, response['JobId'])
+              
+              except botocore.exceptions.ClientError as e:
+                  
+                  if e.response["ResponseMetadata"]["HTTPStatusCode"] == 404:
+                      output = "*** Manifest does not exist. Skipping batch job creation. ***"
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Output" : output}, "NO_JOB")
+                      return
+              
+                  reason = f"Failed to create S3 Batch Operations Job: {e}"
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, None , False, reason)                   
+
+  S3BatchOpsCreatorRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "logs:CreateLogGroup"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                Resource:
+                  - !Sub "${AthenaResultsBucket.Arn}/Manifests/*"
+              - Effect: Allow
+                Action:
+                  - "s3:ListBucket"
+                Resource:
+                  - !GetAtt AthenaResultsBucket.Arn
+                Condition:
+                  StringLike:
+                    "s3:prefix": "Manifests/*"
+              - Effect: Allow
+                Action:
+                  - "s3:CreateJob"
+                  - "s3:UpdateJobStatus"
+                Resource:
+                  - "*"
+              - Effect: Allow
+                Action:
+                  - "iam:PassRole"
+                Resource:
+                  - !GetAtt S3BatchOpsExecutorRole.Arn
+        
+  S3BatchOpsExecutorRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - batchoperations.s3.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject*"
+                  - "s3:PutObject*"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${BucketName}/${Prefix}*"
+                  - !Sub "${AthenaResultsBucket.Arn}/Manifests/*"
+                  - !Sub "${AthenaResultsBucket.Arn}/Reports/*"
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource:
+                  - !GetAtt S3BatchOpsDeleteFunction.Arn
+                  - !GetAtt S3BatchOpsCopyFunction.Arn
+
+  S3BatchOpsDeleteFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Runtime: python3.13
+      MemorySize: 1024
+      Timeout: 900
+      Handler: "index.handler"
+      Role: !GetAtt S3BatchOpsDeleteFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          from urllib.parse import unquote_plus
+          from botocore.exceptions import ClientError
+          
+          def handler(event, context):
+          
+              results = {
+                  'invocationSchemaVersion': event['invocationSchemaVersion'],
+                  'treatMissingKeysAs': 'PermanentFailure',
+                  'invocationId': event['invocationId'],
+                  'results': []
+              }
+              
+              s3 = boto3.client('s3')
+          
+              for task in event['tasks']:
+          
+                  task_id = task['taskId']
+                  s3_bucket = task['s3Bucket']
+                  s3_key = unquote_plus(task['s3Key'])
+                  s3_version_id = task.get('s3VersionId', None)
+          
+                  result = {'taskId' : task_id }
+          
+                  try:           
+                      # Delete the object
+                      if s3_version_id:
+                        s3.delete_object(Bucket=s3_bucket, Key=s3_key, VersionId=s3_version_id)
+                      else:
+                        s3.delete_object(Bucket=s3_bucket, Key=s3_key)                      
+          
+                      result['resultCode'] = "Succeeded"
+                      result['resultString'] = "Deleted"
+                  
+                  except ClientError as e:
+                      # Handle specific S3 errors
+                      error_code = e.response['Error']['Code']
+                      error_message = e.response['Error']['Message']
+                  
+                      if error_code == 'NoSuchKey':
+                          # Object doesn't exist - might have been deleted already
+                          result['resultCode'] = "Succeeded"
+                          result['resultString'] = "Not found."
+                          
+                      elif error_code == 'AccessDenied':
+                          # Permission issues
+                          result['resultCode'] = "PermanentFailure"
+                          result['resultString'] = f"Access denied deleting {s3_key} with version {s3_version_id} from bucket {s3_bucket}"
+          
+                      else:
+                          # Other client errors
+                          result['resultCode'] = "PermanentFailure"
+                          result['resultString'] = f"Error deleting {s3_key} with version {s3_version_id} from {s3_bucket}: {error_code} - {error_message}"
+          
+                  results['results'].append(result)
+          
+              return results
+
+  S3BatchOpsDeleteFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:DeleteObject*"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${BucketName}/${Prefix}*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+
+  S3BatchOpsCopyFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Runtime: python3.13
+      MemorySize: 2048
+      Timeout: 900
+      Handler: "index.handler"
+      Role: !GetAtt S3BatchOpsCopyFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import botocore
+          from urllib.parse import unquote_plus
+          from botocore.exceptions import ClientError
+          from boto3.s3.transfer import TransferConfig
+          
+          def handler(event, context):
+          
+              results = {
+                  'invocationSchemaVersion': event['invocationSchemaVersion'],
+                  'treatMissingKeysAs': 'PermanentFailure',
+                  'invocationId': event['invocationId'],
+                  'results': []
+              }
+              
+              client_config = botocore.config.Config(max_pool_connections = 1000)
+              s3 = boto3.client('s3', config = client_config)
+          
+              for task in event['tasks']:
+          
+                  task_id = task['taskId']
+                  s3_bucket = task['s3Bucket']
+                  s3_key = unquote_plus(task['s3Key'])
+                  s3_version_id = task['s3VersionId']
+                  storage_class = event['job']['userArguments']['StorageClass']
+                  kms_key = event['job']['userArguments'].get("KMSKey")
+          
+                  result = {'taskId' : task_id }
+          
+                  try:
+                  
+                      # Get Metadata and Tags
+                      response = s3.head_object(Bucket = s3_bucket, Key = s3_key, VersionId = s3_version_id)
+                      metadata = response['Metadata']
+                      
+                      response = s3.get_object_tagging(Bucket = s3_bucket, Key = s3_key, VersionId = s3_version_id)
+                      tag_set = response['TagSet']
+                      
+                      # Up to 1,000 threads for transferring, each part size max 250MB.
+                      config = TransferConfig(max_concurrency = 1000, multipart_chunksize = 250 * 1024 * 1024)
+                      
+                      copy_source = { 'Bucket' : s3_bucket, 'Key' : s3_key, 'VersionId' : s3_version_id }
+                      extra_args = {
+                          "StorageClass" : storage_class,
+                          "Metadata" : metadata,
+                          "MetadataDirective" : "REPLACE"
+                      }
+                      
+                      if kms_key:
+                          extra_args["SSEKMSKeyId"] = kms_key
+                          extra_args["ServerSideEncryption"] = "aws:kms"
+                      
+                      # Copy the object                      
+                      s3.copy(copy_source, s3_bucket, s3_key, ExtraArgs = extra_args, Config = config)
+                      
+                      # Set tags                      
+                      s3.put_object_tagging(Bucket = s3_bucket, Key = s3_key, Tagging = { 'TagSet' : tag_set })
+          
+                      result['resultCode'] = "Succeeded"
+                      result['resultString'] = "Copied"
+                  
+                  except ClientError as e:
+                      # Handle errors
+                      error_code = e.response['Error']['Code']
+                      error_message = e.response['Error']['Message']
+                  
+                      result['resultCode'] = "PermanentFailure"
+                      result['resultString'] = f"Error copying {s3_key} with version {s3_version_id} in bucket {s3_bucket}: {error_code} - {error_message}"
+          
+                  results['results'].append(result)
+          
+              return results
+
+  S3BatchOpsCopyFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject*"
+                  - "s3:PutObject*"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${BucketName}/${Prefix}*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+
+  ExecuteS3BatchOpsDeleteCreator1:
+    Type: "Custom::ExecuteS3BatchOpsCreator"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteManifestMaker
+    Properties:
+      ServiceTimeout: 60
+      ServiceToken: !GetAtt S3BatchOpsCreator.Arn
+      ManifestBucket: !Ref AthenaResultsBucket
+      ManifestKey: "Manifests/scenario1.csv"
+      ReportBucket: !GetAtt AthenaResultsBucket.Arn
+      ReportPrefix: "Reports/scenario1"
+      Description: "Scenario 1 - Add delete markers"
+      FunctionArn: !GetAtt S3BatchOpsDeleteFunction.Arn
+      S3BatchOpsRoleArn: !GetAtt S3BatchOpsExecutorRole.Arn
+      StartJob: !Ref StartS3BatchOperationsJobs
+
+  ExecuteS3BatchOpsDeleteCreator2:
+    Type: "Custom::ExecuteS3BatchOpsCreator"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteManifestMaker
+    Properties:
+      ServiceTimeout: 60
+      ServiceToken: !GetAtt S3BatchOpsCreator.Arn
+      ManifestBucket: !Ref AthenaResultsBucket
+      ManifestKey: "Manifests/scenario2.csv"
+      HasVersionIds: True
+      ReportBucket: !GetAtt AthenaResultsBucket.Arn
+      ReportPrefix: "Reports/scenario2"
+      Description: "Scenario 2 - Delete delete markers"
+      FunctionArn: !GetAtt S3BatchOpsDeleteFunction.Arn
+      S3BatchOpsRoleArn: !GetAtt S3BatchOpsExecutorRole.Arn
+      StartJob: !Ref StartS3BatchOperationsJobs
+
+  ExecuteS3BatchOpsCopyCreator3b:
+    Type: "Custom::ExecuteS3BatchOpsCreator"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteManifestMaker
+    Properties:
+      ServiceTimeout: 60
+      ServiceToken: !GetAtt S3BatchOpsCreator.Arn
+      ManifestBucket: !Ref AthenaResultsBucket
+      ManifestKey: "Manifests/scenario3b.csv"
+      HasVersionIds: True
+      ReportBucket: !GetAtt AthenaResultsBucket.Arn
+      ReportPrefix: "Reports/scenario3b"
+      Description: "Scenario 3b - Restore older object versions"
+      TargetBucket: !Ref BucketName
+      StorageClass: !Ref StorageClass
+      KMSKey: !If [WantKMS, !Ref KMSKey, !Ref "AWS::NoValue" ]
+      S3BatchOpsRoleArn: !GetAtt S3BatchOpsExecutorRole.Arn
+      StartJob: !Ref StartS3BatchOperationsJobs
+
+  ExecuteS3BatchOpsCopyCreator3c:
+    Type: "Custom::ExecuteS3BatchOpsCopyCreator"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteManifestMaker
+    Properties:
+      ServiceTimeout: 60
+      ServiceToken: !GetAtt S3BatchOpsCreator.Arn
+      ManifestBucket: !Ref AthenaResultsBucket
+      ManifestKey: "Manifests/scenario3c.csv"
+      HasVersionIds: True
+      ReportBucket: !GetAtt AthenaResultsBucket.Arn
+      ReportPrefix: "Reports/scenario3c"
+      Description: "Scenario 3c - Restore older object versions > 5GB"
+      FunctionArn: !GetAtt S3BatchOpsCopyFunction.Arn
+      StorageClass: !Ref StorageClass
+      KMSKey: !If [WantKMS, !Ref KMSKey, !Ref "AWS::NoValue" ]
+      S3BatchOpsRoleArn: !GetAtt S3BatchOpsExecutorRole.Arn
+      StartJob: !Ref StartS3BatchOperationsJobs
+
+Outputs:    
+  Manifests:
+    Description: Location of the Manifests for S3 Batch Operations
+    Value: !Sub "s3://${AthenaResultsBucket}/Manifests/"
+ 
+  S3BatchOperationsDelete1Job:
+    Description: AWS Management Console link for S3 Batch Operations Delete Job (Scenario 1)
+    Value: !GetAtt ExecuteS3BatchOpsDeleteCreator1.Output
+    
+  S3BatchOperationsDelete2Job:
+    Description: AWS Management Console link for S3 Batch Operations Delete Job (Scenario 2)
+    Value: !GetAtt ExecuteS3BatchOpsDeleteCreator2.Output
+    
+  S3BatchOperationsCopy3bJob:
+    Description: AWS Management Console link for S3 Batch Operations Copy Job (Scenario 3b)
+    Value: !GetAtt ExecuteS3BatchOpsCopyCreator3b.Output
+    
+  S3BatchOperationsCopy3cJob:
+    Description: AWS Management Console link for S3 Batch Operations Copy Job (Scenario 3c)
+    Value: !GetAtt ExecuteS3BatchOpsCopyCreator3c.Output
+
+  CopyRole3b:
+    Description: ARN of the IAM Role used by the S3 Batch Operations Copy Job (Scenario 3b)
+    Value: !GetAtt S3BatchOpsExecutorRole.Arn
+
+  CopyRole3c:
+    Description: ARN of the IAM Role used by the S3 Batch Operations Copy Job (Scenario 3c)
+    Value: !GetAtt S3BatchOpsCopyFunctionRole.Arn
