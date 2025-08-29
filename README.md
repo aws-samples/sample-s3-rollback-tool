@@ -83,7 +83,7 @@ The tool outputs manifest files for S3 Batch Operations jobs, in the S3 path ref
 
 * **Scenario 1**:  Where all version of key have last_modified after the desired Point In Time (PIT), or the current version at the desired PIT was a delete marker, and current version is not a delete marker. **Add a delete marker.**
 * **Scenario 2:**  Keys where there are only delete markers (no new objects) after the PIT. **These delete markers will be deleted.**
-    * `scenario2-undo.csv` will also be created so that these can be recreated if needed. See [FAQ #3](#faqs).
+    * `scenario2_undo.csv` will also be created so that these can be recreated if needed. See [FAQ #3](#faqs).
 * **Scenarios 3a, b and c:** Keys where there was an object (not a delete marker) at the PIT, and there is current version newer than at the PIT. Excludes keys covered by scenarios 1 and 2. **The desired VersionID must be copied back to the top of the top.**
     * **3a:** Desired VersionID is in GFR/GDA class and needs to be restored from async. **This tool will not copy these objects**, but output its details in the `scenario3a.csv` manifest that can be used with [**Guidance for Automated Restore and Copy for Amazon S3 Glacier Objects**](https://github.com/aws-solutions-library-samples/guidance-for-automated-restore-and-copy-for-amazon-s3-glacier-objects).
         * Note that as ListObjectVersions and S3 Metadata don't report Intelligent Tiering tier, objects versions that need to be retrieved before being copied from the opt-in Archive and Deep Archive tiers won’t be included here unless an S3 Inventory source is used. Instead they will be included in scenario 3b or 3c, and an attempt made to copy them. These copy attempts will fail with `403: InvalidObjectState` 
