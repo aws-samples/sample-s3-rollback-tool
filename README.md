@@ -12,7 +12,7 @@ The tool will not delete any data - it works by adding and removing delete marke
 
 ## Quick start guide
 
-Before reverting changes you should prevent further changes taking place, for example with an update to your [bucket policy](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-policies.html) to deny PUT and DELETE operations by roles other than the ones being used with this tool. Then, deploy the [CloudFormation template](s3-rollback.yaml) in the same AWS Region as the S3 bucket you want to roll back. During deployment, specify:
+Before reverting changes you should prevent further changes taking place, for example with an update to your [bucket policy](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-policies.html) to deny PUT and DELETE operations by roles other than the ones created when deploying this tool. Then, deploy the [CloudFormation template](s3-rollback.yaml) in the same AWS Region as the S3 bucket you want to roll back. During deployment, specify:
 
 1. **Bucket**: The name of the bucket to roll back.
 2. **TimeStamp**: The date and time to roll back to *in the UTC timezone*, in ISO *\<yyyy-mm-dd>T\<hh:mm:ss>* format. For example: *2025-08-30T02:00:00*.
