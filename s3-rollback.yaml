@@ -5,14 +5,13 @@ Parameters:
   BucketName:
     Type: String
     Description: The Amazon S3 bucket name to be rolled back to a point in time. Must have versioning enabled.
-    AllowedPattern: '.+'
+    AllowedPattern: '[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]'
     ConstraintDescription: Bucket name must not be blank
     Default: "bucket"
 
   TimeStamp:
     Type: String
     Description: The date and time to roll back to in the UTC timezone, in ISO <yyyy-mm-ddThh:mm:ss> format. For example 2025-08-30T02:00:00.
-
     AllowedPattern: '\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}((\+\d{2}:\d{2})|Z)?'
     ConstraintDescription: Please enter a timestamp in ISO format, e.g. 2025-08-30T02:00:00
     Default: "2025-08-30T02:00:00"
@@ -53,19 +52,9 @@ Parameters:
 
   InventoryCSVLocation:
     Type: String
-    Description: S3 URI of CSV inventory file(s) to use instead of S3 Inventory (e.g. s3://bucket/prefix/). Can be generated with https://github.com/aws-samples/sample-s3-listobjectversions-to-csv
-    AllowedPattern: '(s3://.+/)?'
-    ConstraintDescription: Please enter an S3 location ending in '/', e.g. s3://mybucket/prefix/
-    Default: ""
-
-  InventoryTableName:
-    Type: String
-    Description: Name of a pre-existing parquet-formatted inventory table in Athena.
-    Default: ""
-
-  DT:
-    Type: String
-    Description: dt= value for the pre-existing Athena table.
+    Description: S3 location of a CSV inventory file to use instead of S3 Inventory (e.g. s3://bucket/prefix/inventory.csv). Can be generated with https://github.com/aws-samples/sample-s3-listobjectversions-to-csv
+    AllowedPattern: "^(|s3://[a-zA-Z0-9._-]+(/[^/]+)*\\.csv)$"
+    ConstraintDescription: Please enter an S3 location ending in .csv e.g. s3://mybucket/prefix/inventory.csv
     Default: ""
 
 Metadata:
@@ -86,12 +75,6 @@ Metadata:
           - StorageClass
           - KMSKey
           - InventoryCSVLocation
-      -
-        Label:
-          default: "Advanced parameters"
-        Parameters:
-          - InventoryTableName
-          - DT
 
     ParameterLabels:
         BucketName:
@@ -108,29 +91,188 @@ Metadata:
           default: Start S3 Batch Operations jobs
         InventoryCSVLocation:
           default: Specify CSV inventory
-        InventoryTableName:
-          default: Athena table name
 
 Conditions:
-  CreateInventory: !And
-    - !Equals [ !Ref InventoryTableName, "" ]
-    - !Equals [ !Ref InventoryCSVLocation, "" ]
+  CreateInventory: !Equals
+    - !Ref InventoryCSVLocation
+    - ""
   
-  UseInventoryTable: !Not
-    - !Equals [ !Ref InventoryTableName, "" ]
-
   UseInventoryCSV: !Not
-    - !Equals [ !Ref InventoryCSVLocation, "" ]
-    
-  CreateInventoryOrUseCSV: !Or
-    - !Condition CreateInventory
-    - !Condition UseInventoryCSV
+    - !Equals [ !Ref InventoryCSVLocation, "" ]    
  
   WantKMS: !Not
     - !Equals [ !Ref KMSKey, "" ]
     
 Resources:
 
+  BucketCleaner:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Runtime: python3.13
+      MemorySize: 1024
+      Timeout: 900
+      Handler: "index.handler"
+      Role: !GetAtt BucketCleanerRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import boto3
+            
+          def handler(event, context):
+            
+            if event["RequestType"] != "Delete":
+              status = {
+                "Status" : f'Exiting on RequestType = {event["RequestType"]}',
+                "Event" : event
+              }
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, status)
+              return
+            
+            bucket = event["ResourceProperties"]["Bucket"]
+            s3 = boto3.client("s3")
+            
+            try:
+              response = s3.head_bucket(Bucket = bucket)
+            except Exception as e:
+              status = {
+                "Status" : f'Exiting due to error = {e}',
+                "Event" : event
+              }
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, status)
+              return
+            
+            count = 0
+            total = 0
+            
+            for p in s3.get_paginator('list_objects_v2').paginate(Bucket = bucket):
+            
+              keys = [ {"Key" : c["Key"] } for c in p.get("Contents", []) ]
+                
+              if keys:
+                total += len(keys)                
+                response = s3.delete_objects(Bucket = bucket, Delete = { "Objects" : keys })
+                count += len(response.get("Deleted", []))
+                
+            status = { "Status" : f'Deleted {count} / {total} keys.' }
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, status)
+
+  BucketCleanerRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "logs:CreateLogGroup"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action:
+                  - "s3:ListBucket"
+                  - "s3:DeleteObject"
+                Resource:
+                  - !GetAtt AthenaResultsBucket.Arn
+                  - !Sub "${AthenaResultsBucket.Arn}/*"
+                  
+  CheckVersioning:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Runtime: python3.13
+      MemorySize: 128
+      Timeout: 60
+      Handler: "index.handler"
+      Role: !GetAtt CheckVersioningRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import boto3
+          import botocore.exceptions
+          
+          def handler(event, context):
+          
+            if event["RequestType"] != "Create":
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              return
+            
+            bucket = event["ResourceProperties"]["Bucket"]
+            
+            # Ensure bucket has versioning enabled.
+            
+            try:
+            
+              s3 = boto3.client("s3")
+              response = s3.get_bucket_versioning(Bucket = bucket)
+            
+              if response.get("Status") != "Enabled":
+                reason = f"Bucket '{bucket}' does not have versioning enabled."
+                cfnresponse.send(event, context, cfnresponse.FAILED, {}, None , False, reason)
+                
+              else:
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+             
+              return          
+            
+            except botocore.exceptions.ClientError as error:
+            
+              if error.response['Error']['Code'] == "NoSuchBucket":
+                reason = f"Bucket '{bucket}' does not exist."
+            
+              else:
+                reason = f"Error listing inventory configurations for bucket '{bucket}': {error.response['Error']['Message']}"
+            
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, None , False, reason)
+              return
+
+  CheckVersioningRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "logs:CreateLogGroup"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action:
+                  - "s3:GetBucketVersioning"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${BucketName}"
+  
   AthenaResultsBucket:
     Type: "AWS::S3::Bucket"
 
@@ -146,7 +288,7 @@ Resources:
     Type: AWS::LakeFormation::PrincipalPermissions
     Properties:
       Principal:
-        DataLakePrincipalIdentifier: !GetAtt AthenaAccessRole.Arn
+        DataLakePrincipalIdentifier: !GetAtt QueryExecutorRole.Arn
       Resource:
         Database:
           CatalogId: !Ref "AWS::AccountId"
@@ -165,20 +307,13 @@ Resources:
       WorkGroupConfiguration: 
         EnforceWorkGroupConfiguration: false 
 
-  ExecuteClean:
-    Type: "Custom::ExecuteCleanerFunction"
-    Properties:
-      ServiceTimeout: 900
-      ServiceToken: !GetAtt BucketCleaner.Arn
-      Bucket: !Ref AthenaResultsBucket
-
   InventoryFinder:
     Type: "AWS::Lambda::Function"
     Condition: CreateInventory
     Properties:
       Runtime: python3.13
       MemorySize: 1024
-      Timeout: 900
+      Timeout: 60
       Handler: "index.handler"
       Role: !GetAtt InventoryFinderRole.Arn
       Code:
@@ -212,6 +347,7 @@ Resources:
             s3 = session.client("s3")
             
             try:
+            
               response = s3.list_bucket_inventory_configurations(Bucket = bucket)
             
             except botocore.exceptions.ClientError as error:
@@ -297,6 +433,7 @@ Resources:
             
             if response_data is None:
               reason = f"Couldn't find an inventory for bucket '{bucket}' in ORC / Parquet format, "\
+                          "which includes all object versions, "\
                           f"with fields {fields}, and inventory reports >= {timestamp}."
               
               if (bad_prefix):
@@ -349,16 +486,102 @@ Resources:
                 Resource:
                   - "*"
 
-  ExecuteInventoryFinder:
-    Type: "Custom::ExecuteInventoryFinderFunction"
-    Condition: CreateInventory
+  InventoryCopier:
+    Type: "AWS::Lambda::Function"
+    Condition: UseInventoryCSV
     Properties:
-      ServiceTimeout: 900
-      ServiceToken: !GetAtt InventoryFinder.Arn
-      Bucket: !Ref BucketName
-      Prefix: !Ref Prefix
-      TimeStamp: !Ref TimeStamp
-      
+      Runtime: python3.13
+      MemorySize: 1024
+      Timeout: 900
+      Handler: "index.handler"
+      Role: !GetAtt InventoryCopierRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import re
+          import boto3
+          import botocore
+          from boto3.s3.transfer import TransferConfig
+          
+          def handler(event, context):
+          
+              # Only execute on create.
+              if event["RequestType"] != "Create":
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+                  
+              # Where is the CSV source file?
+              csv_source = event["ResourceProperties"]["CSVLocation"]
+              dest_bucket = event["ResourceProperties"]["CSVDestinationBucket"]
+              dest_key = event["ResourceProperties"]["CSVDestinationKey"]
+          
+              match = re.match("s3://([a-z0-9.-]+)/(.+)", csv_source)
+              if match is None:
+                  reason = f"Invalid CSV source: {csv_source}"
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, None , False, reason)
+                  return
+              
+              source_bucket = match.group(1)
+              source_key = match.group(2)
+          
+              client_config = botocore.config.Config(max_pool_connections = 1000)
+              s3 = boto3.client('s3', config = client_config)
+          
+              config = TransferConfig(max_concurrency = 1000, multipart_chunksize = 250 * 1024 * 1024)           
+              copy_source = { 'Bucket' : source_bucket, 'Key' : source_key }
+              reason = None
+              
+              try:
+                  # Copy the CSV
+                  s3.copy(copy_source, dest_bucket, dest_key, Config = config)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              
+              except Exception as e:
+          
+                  reason = f"Cannot access {csv_source}"
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, None , False, reason)
+                  return
+            
+  InventoryCopierRole:
+    Type: "AWS::IAM::Role"
+    Condition: UseInventoryCSV
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "logs:CreateLogGroup"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                Resource:
+                  - !Join [ "", [ !Sub "arn:${AWS::Partition}:s3:::", !Select [ 1, !Split [ "s3://", !Ref InventoryCSVLocation ] ] ] ]
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                Resource:
+                  - !Join [ "", [ !GetAtt AthenaResultsBucket.Arn, "/ImportCSV/inventory.csv" ] ]
+
   CreatePITTable:
     Type: "AWS::Athena::NamedQuery"
     Condition: CreateInventory
@@ -437,7 +660,28 @@ Resources:
             LOCATION '${CSVLocation}'
             TBLPROPERTIES ("skip.header.line.count"="1")
 
-        - CSVLocation: !Ref InventoryCSVLocation
+        - CSVLocation: !Sub "s3://${AthenaResultsBucket}/ImportCSV/"
+          GlueDB: !Ref GlueDatabase
+
+  CheckCSVImportTable:
+    Type: "AWS::Athena::NamedQuery"
+    Condition: UseInventoryCSV
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Checks to ensure the CSV table only has records from the correct bucket"
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub
+        - |
+            -- Checks to ensure the CSV table only has records from the correct bucket
+
+            SELECT
+                     DISTINCT bucket
+            FROM
+                     ${GlueDB}.csv_import
+            WHERE
+                     NOT bucket = '${SourceBucket}'
+
+        - SourceBucket: !Ref BucketName
           GlueDB: !Ref GlueDatabase
 
   CreateCSVPITTable:
@@ -500,17 +744,15 @@ Resources:
                 storage_class,
                 intelligent_tiering_access_tier
             FROM
-                ${SourceDB}.${PITTable}
+                ${GlueDB}.pit_table
             WHERE
                 dt = '${DateTime}' and
                 starts_with(key, '${Prefix}') and
                 bucket = '${SourceBucket}'
                 
-        - DateTime: !If [ CreateInventory, !GetAtt ExecuteInventoryFinder.DateTime, !If [ UseInventoryCSV, "", !Ref DT ] ]
+        - DateTime: !If [ CreateInventory, !GetAtt ExecuteInventoryFinder.DateTime, "" ]
           GlueDB: !Ref GlueDatabase
-          PITTable: !If [ CreateInventoryOrUseCSV, "pit_table", !Ref InventoryTableName ]
           ResultsBucket: !Ref AthenaResultsBucket
-          SourceDB: !If [ CreateInventoryOrUseCSV, !Ref GlueDatabase, "default" ]
           SourceBucket: !Ref BucketName
           Prefix: !Ref Prefix
 
@@ -1132,92 +1374,6 @@ Resources:
                   - !GetAtt AthenaResultsBucket.Arn
                   - !Sub "${AthenaResultsBucket.Arn}/*"
                   
-  BucketCleaner:
-    Type: "AWS::Lambda::Function"
-    Properties:
-      Runtime: python3.13
-      MemorySize: 1024
-      Timeout: 900
-      Handler: "index.handler"
-      Role: !GetAtt BucketCleanerRole.Arn
-      Code:
-        ZipFile: |
-          import cfnresponse
-          import boto3
-            
-          def handler(event, context):
-            
-            if event["RequestType"] != "Delete":
-              status = {
-                "Status" : f'Exiting on RequestType = {event["RequestType"]}',
-                "Event" : event
-              }
-              cfnresponse.send(event, context, cfnresponse.SUCCESS, status)
-              return
-            
-            bucket = event["ResourceProperties"]["Bucket"]
-            s3 = boto3.client("s3")
-            
-            try:
-              response = s3.head_bucket(Bucket = bucket)
-            except Exception as e:
-              status = {
-                "Status" : f'Exiting due to error = {e}',
-                "Event" : event
-              }
-              cfnresponse.send(event, context, cfnresponse.SUCCESS, status)
-              return
-            
-            count = 0
-            total = 0
-            
-            for p in s3.get_paginator('list_objects_v2').paginate(Bucket = bucket):
-            
-              keys = [ {"Key" : c["Key"] } for c in p.get("Contents", []) ]
-                
-              if keys:
-                total += len(keys)                
-                response = s3.delete_objects(Bucket = bucket, Delete = { "Objects" : keys })
-                count += len(response.get("Deleted", []))
-                
-            status = { "Status" : f'Deleted {count} / {total} keys.' }
-            cfnresponse.send(event, context, cfnresponse.SUCCESS, status)
-
-  BucketCleanerRole:
-    Type: "AWS::IAM::Role"
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - lambda.amazonaws.com
-            Action:
-              - "sts:AssumeRole"
-      Policies:
-        - PolicyName: root
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action: "logs:CreateLogGroup"
-                Resource:
-                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
-              - Effect: Allow
-                Action:
-                  - "logs:CreateLogStream"
-                  - "logs:PutLogEvents"
-                Resource:
-                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
-              - Effect: Allow
-                Action:
-                  - "s3:ListBucket"
-                  - "s3:DeleteObject"
-                Resource:
-                  - !GetAtt AthenaResultsBucket.Arn
-                  - !Sub "${AthenaResultsBucket.Arn}/*"
-                  
   QueryExecutor:
     Type: "AWS::Lambda::Function"
     Properties:
@@ -1225,7 +1381,7 @@ Resources:
       MemorySize: 1024
       Timeout: 900
       Handler: "index.handler"
-      Role: !GetAtt AthenaAccessRole.Arn
+      Role: !GetAtt QueryExecutorRole.Arn
       Code:
         ZipFile: |
           import cfnresponse
@@ -1290,7 +1446,7 @@ Resources:
               except Exception as e:
                 cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, f"Caught exception: {e}")
           
-  AthenaAccessRole:
+  QueryExecutorRole:
     Type: "AWS::IAM::Role"
     Properties:
       AssumeRolePolicyDocument:
@@ -1362,224 +1518,85 @@ Resources:
                 Resource:
                   - !GetAtt AthenaResultsBucket.Arn
         
-  ExecuteCreatePITTable:
-    Type: "Custom::ExecuteCreatePITTableFunction"
-    Condition: CreateInventory
-    DependsOn:
-    - ExecuteClean
+  CSVChecker:
+    Type: "AWS::Lambda::Function"
     Properties:
-      ServiceTimeout: 900
-      ServiceToken: !GetAtt QueryExecutor.Arn
-      QueryID: !GetAtt CreatePITTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
-      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreatePITTable/"
-
-  ExecuteCreateCSVImportTable:
-    Type: "Custom::ExecuteCreateCSVImportTableFunction"
-    Condition: UseInventoryCSV
-    DependsOn:
-    - ExecuteClean
-    Properties:
-      ServiceTimeout: 900
-      ServiceToken: !GetAtt QueryExecutor.Arn
-      QueryID: !GetAtt CreateCSVImportTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
-      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateCSVImportTable/"
-
-  ExecuteCreateCSVPITTable:
-    Type: "Custom::ExecuteCreateCSVPITTableFunction"
-    Condition: UseInventoryCSV
-    DependsOn:
-    - ExecuteCreateCSVImportTable
-    Properties:
-      ServiceTimeout: 900
-      ServiceToken: !GetAtt QueryExecutor.Arn
-      QueryID: !GetAtt CreateCSVPITTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
-      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateCSVPITTable/"
-
-  ExecuteCreateAllVersionsTable:
-    Type: "Custom::ExecuteCreateAllVersionsTableFunction"
-    DependsOn:
-    - ExecuteClean
-    Properties:
-      ServiceTimeout: 900
-      ServiceToken: !GetAtt QueryExecutor.Arn
-      QueryID: !GetAtt CreateAllVersionsTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
-      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateAllVersionsTable/"
-      Dependency: !If
-        - CreateInventory
-        - !GetAtt ExecuteCreatePITTable.State
-        - !If
-          - UseInventoryCSV
-          - !GetAtt ExecuteCreateCSVPITTable.State
-          - !Ref AWS::NoValue
-
-  ExecuteCreateLatestVersionsTable:
-    Type: "Custom::ExecuteCreateLatestVersionsTableFunction"
-    DependsOn:
-    - ExecuteClean
-    - ExecuteCreateAllVersionsTable
-    Properties:
-      ServiceTimeout: 900
-      ServiceToken: !GetAtt QueryExecutor.Arn
-      QueryID: !GetAtt CreateLatestVersionsTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
-      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateLatestVersionsTable/"
-
-  ExecuteCreateDesiredTable:
-    Type: "Custom::ExecuteCreateDesiredTableFunction"
-    DependsOn:
-    - ExecuteClean
-    - ExecuteCreateAllVersionsTable
-    Properties:
-      ServiceTimeout: 900
-      ServiceToken: !GetAtt QueryExecutor.Arn
-      QueryID: !GetAtt CreateDesiredTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
-      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateDesiredTable/"
-
-  ExecuteCreateDesiredVersionsTable:
-    Type: "Custom::ExecuteCreateDesiredVersionsTableFunction"
-    DependsOn:
-    - ExecuteClean
-    - ExecuteCreateDesiredTable
-    Properties:
-      ServiceTimeout: 900
-      ServiceToken: !GetAtt QueryExecutor.Arn
-      QueryID: !GetAtt CreateDesiredVersionsTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
-      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateDesiredVersionsTable/"
-
-  ExecuteCreateChangedKeysTable:
-    Type: "Custom::ExecuteCreateChangedKeysTableFunction"
-    DependsOn:
-    - ExecuteClean
-    - ExecuteCreateDesiredVersionsTable
-    - ExecuteCreateLatestVersionsTable
-    Properties:
-      ServiceTimeout: 900
-      ServiceToken: !GetAtt QueryExecutor.Arn
-      QueryID: !GetAtt CreateChangedKeysTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
-      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateChangedKeysTable/"
-
-  ExecuteCreateCountVersionsTable:
-    Type: "Custom::ExecuteCreateCountVersionsTableFunction"
-    DependsOn:
-    - ExecuteClean
-    - ExecuteCreateAllVersionsTable
-    - ExecuteCreateDesiredVersionsTable
-    - ExecuteCreateLatestVersionsTable
-    Properties:
-      ServiceTimeout: 900
-      ServiceToken: !GetAtt QueryExecutor.Arn
-      QueryID: !GetAtt CreateCountVersionsTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
-      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateCountVersionsTable/"
-
-  ExecuteCreateScenario1Table:
-    Type: "Custom::ExecuteCreateScenario1TableFunction"
-    DependsOn:
-    - ExecuteClean
-    - ExecuteCreateAllVersionsTable
-    - ExecuteCreateLatestVersionsTable
-    - ExecuteCreateDesiredTable
-    Properties:
-      ServiceTimeout: 900
-      ServiceToken: !GetAtt QueryExecutor.Arn
-      QueryID: !GetAtt CreateScenario1Table.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
-      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario1Table/"
-
-  ExecuteCreateScenario2Table:
-    Type: "Custom::ExecuteCreateScenario2TableFunction"
-    DependsOn:
-    - ExecuteClean
-    - ExecuteCreateCountVersionsTable
-    Properties:
-      ServiceTimeout: 900
-      ServiceToken: !GetAtt QueryExecutor.Arn
-      QueryID: !GetAtt CreateScenario2Table.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
-      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario2Table/"
-
-  ExecuteCreateScenario2UndoTable:
-    Type: "Custom::ExecuteCreateScenario2UndoTableFunction"
-    DependsOn:
-    - ExecuteClean
-    - ExecuteCreateScenario2Table
-    Properties:
-      ServiceTimeout: 900
-      ServiceToken: !GetAtt QueryExecutor.Arn
-      QueryID: !GetAtt CreateScenario2UndoTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
-      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario2UndoTable/"
-
-  ExecuteCreateScenario3aTable:
-    Type: "Custom::ExecuteCreateScenario3aTableFunction"
-    DependsOn:
-    - ExecuteClean
-    - ExecuteCreateChangedKeysTable
-    - ExecuteCreateCountVersionsTable
-    Properties:
-      ServiceTimeout: 900
-      ServiceToken: !GetAtt QueryExecutor.Arn
-      QueryID: !GetAtt CreateScenario3aTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
-      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario3aTable/"
-
-  ExecuteCreateScenario3bTable:
-    Type: "Custom::ExecuteCreateScenario3bTableFunction"
-    DependsOn:
-    - ExecuteClean
-    - ExecuteCreateChangedKeysTable
-    - ExecuteCreateCountVersionsTable
-    Properties:
-      ServiceTimeout: 900
-      ServiceToken: !GetAtt QueryExecutor.Arn
-      QueryID: !GetAtt CreateScenario3bTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
-      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario3bTable/"
-
-  ExecuteCreateScenario3cTable:
-    Type: "Custom::ExecuteCreateScenario3cViewTable"
-    DependsOn:
-    - ExecuteClean
-    - ExecuteCreateChangedKeysTable
-    - ExecuteCreateCountVersionsTable
-    Properties:
-      ServiceTimeout: 900
-      ServiceToken: !GetAtt QueryExecutor.Arn
-      QueryID: !GetAtt CreateScenario3cTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
-      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario3cTable/"
-
-  ExecuteManifestMaker:
-    Type: "Custom::ExecuteManifestMakerFunction"
-    DependsOn:
-    - ExecuteClean
-    - ExecuteCreateScenario1Table
-    - ExecuteCreateScenario2Table
-    - ExecuteCreateScenario2UndoTable
-    - ExecuteCreateScenario3aTable
-    - ExecuteCreateScenario3bTable
-    - ExecuteCreateScenario3cTable
-    Properties:
-      ServiceTimeout: 900
-      ServiceToken: !GetAtt ManifestMaker.Arn
-      SourceBucket: !Ref AthenaResultsBucket
-      TableSource: Tables/
-      ManifestDestination: Manifests/
-      Tables:
-        - scenario1
-        - scenario2
-        - scenario2_undo
-        - scenario3a
-        - scenario3b
-        - scenario3c
-
+      Runtime: python3.13
+      MemorySize: 1024
+      Timeout: 60
+      Handler: "index.handler"
+      Role: !GetAtt QueryExecutorRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import time
+          import boto3
+          
+          def handler(event, context):
+          
+              # Only execute on create.
+              if event["RequestType"] != "Create":
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+                  
+              query_id = event["ResourceProperties"]["QueryID"]
+              
+              # Where to place the results
+              results_location = event["ResourceProperties"]["ResultsLocation"]
+              
+              # What CSV file did we read?
+              csv_location = event["ResourceProperties"]["CSVLocation"]
+          
+              # What bucket should we expect to find?
+              bucket = event["ResourceProperties"]["Bucket"]
+          
+              workgroup = event["ResourceProperties"]["WorkGroup"]
+              
+              s3 = boto3.client("s3")
+              athena = boto3.client("athena")
+              
+              query = athena.get_named_query(NamedQueryId = query_id)
+              
+              try:
+                response = athena.start_query_execution(
+                    QueryString = query["NamedQuery"]["QueryString"],
+                    ResultConfiguration = { "OutputLocation" : results_location },
+                    WorkGroup = workgroup
+                )
+              
+                execution_id = response["QueryExecutionId"]
+                response = athena.get_query_execution(QueryExecutionId = execution_id)
+              
+                # Wait for query to finish.
+                while response["QueryExecution"]["Status"]["State"] in ["QUEUED", "RUNNING"]:
+                  
+                    time.sleep(5)
+                    response = athena.get_query_execution(QueryExecutionId = execution_id)
+              
+                if response["QueryExecution"]["Status"]["State"] == "SUCCEEDED":
+                  
+                  # Did the query find buckets in the CSV that don't match the target bucket name?
+                  response = athena.get_query_results(QueryExecutionId = execution_id)
+                  bad_buckets = list(map(lambda r : f"'{r["Data"][0]["VarCharValue"]}'", response["ResultSet"]["Rows"]))[1:]
+          
+                  if bad_buckets:
+                      reason = f"CSV inventory files in '{csv_location}' contain bucket names that don't match target bucket name: '{bucket}'. Found {', '.join(bad_buckets)}"
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, reason)
+                      return
+          
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {"State" : "SUCCEEDED"})
+                      return
+              
+                else:
+                    reason = str(response["QueryExecution"]["Status"]["AthenaError"])
+                    cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, reason)
+                    return
+              
+              except Exception as e:
+                cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, f"Caught exception: {e}")
+                return
+                
   S3BatchOpsCreator:
     Type: "AWS::Lambda::Function"
     Properties:
@@ -2067,6 +2084,272 @@ Resources:
                   - "logs:PutLogEvents"
                 Resource:
                   - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+  
+  ExecuteCheckVersioning:
+    Type: "Custom::ExecuteCheckVersioningFunction"
+    Properties:
+      ServiceTimeout: 60
+      ServiceToken: !GetAtt CheckVersioning.Arn
+      Bucket: !Ref BucketName
+
+  ExecuteClean:
+    Type: "Custom::ExecuteCleanerFunction"
+    DependsOn:
+    - ExecuteCheckVersioning
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt BucketCleaner.Arn
+      Bucket: !Ref AthenaResultsBucket
+
+  ExecuteInventoryFinder:
+    Type: "Custom::ExecuteInventoryFinderFunction"
+    Condition: CreateInventory
+    DependsOn:
+    - ExecuteClean
+    Properties:
+      ServiceTimeout: 60
+      ServiceToken: !GetAtt InventoryFinder.Arn
+      Bucket: !Ref BucketName
+      Prefix: !Ref Prefix
+      TimeStamp: !Ref TimeStamp
+      
+  ExecuteCreatePITTable:
+    Type: "Custom::ExecuteCreatePITTableFunction"
+    Condition: CreateInventory
+    DependsOn:
+    - ExecuteClean
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreatePITTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreatePITTable/"
+
+  ExecuteInventoryCopier:
+    Type: "Custom::ExecuteCreateCSVImportTableFunction"
+    Condition: UseInventoryCSV
+    DependsOn:
+    - ExecuteClean
+    Properties:
+      ServiceTimeout: 60
+      ServiceToken: !GetAtt InventoryCopier.Arn
+      CSVLocation: !Ref InventoryCSVLocation 
+      CSVDestinationBucket: !Ref AthenaResultsBucket
+      CSVDestinationKey: "ImportCSV/inventory.csv"      
+
+  ExecuteCreateCSVImportTable:
+    Type: "Custom::ExecuteCreateCSVImportTableFunction"
+    Condition: UseInventoryCSV
+    DependsOn:
+    - ExecuteInventoryCopier
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateCSVImportTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateCSVImportTable/"
+
+  ExecuteCSVChecker:
+    Type: "Custom::ExecuteCSVCheckFunction"
+    Condition: UseInventoryCSV
+    DependsOn:
+    - ExecuteCreateCSVImportTable
+    Properties:
+      ServiceTimeout: 60
+      ServiceToken: !GetAtt CSVChecker.Arn
+      QueryID: !GetAtt CheckCSVImportTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CheckCSV/"
+      CSVLocation: !Ref InventoryCSVLocation
+      Bucket: !Ref BucketName
+
+  ExecuteCreateCSVPITTable:
+    Type: "Custom::ExecuteCreateCSVPITTableFunction"
+    Condition: UseInventoryCSV
+    DependsOn:
+    - ExecuteCSVChecker
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateCSVPITTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateCSVPITTable/"
+
+  ExecuteCreateAllVersionsTable:
+    Type: "Custom::ExecuteCreateAllVersionsTableFunction"
+    DependsOn:
+    - ExecuteClean
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateAllVersionsTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateAllVersionsTable/"
+      Dependency: !If [ CreateInventory, !GetAtt ExecuteCreatePITTable.State, !GetAtt ExecuteCreateCSVPITTable.State ]
+
+  ExecuteCreateLatestVersionsTable:
+    Type: "Custom::ExecuteCreateLatestVersionsTableFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateAllVersionsTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateLatestVersionsTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateLatestVersionsTable/"
+
+  ExecuteCreateDesiredTable:
+    Type: "Custom::ExecuteCreateDesiredTableFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateAllVersionsTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateDesiredTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateDesiredTable/"
+
+  ExecuteCreateDesiredVersionsTable:
+    Type: "Custom::ExecuteCreateDesiredVersionsTableFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateDesiredTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateDesiredVersionsTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateDesiredVersionsTable/"
+
+  ExecuteCreateChangedKeysTable:
+    Type: "Custom::ExecuteCreateChangedKeysTableFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateDesiredVersionsTable
+    - ExecuteCreateLatestVersionsTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateChangedKeysTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateChangedKeysTable/"
+
+  ExecuteCreateCountVersionsTable:
+    Type: "Custom::ExecuteCreateCountVersionsTableFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateAllVersionsTable
+    - ExecuteCreateDesiredVersionsTable
+    - ExecuteCreateLatestVersionsTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateCountVersionsTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateCountVersionsTable/"
+
+  ExecuteCreateScenario1Table:
+    Type: "Custom::ExecuteCreateScenario1TableFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateAllVersionsTable
+    - ExecuteCreateLatestVersionsTable
+    - ExecuteCreateDesiredTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateScenario1Table.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario1Table/"
+
+  ExecuteCreateScenario2Table:
+    Type: "Custom::ExecuteCreateScenario2TableFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateCountVersionsTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateScenario2Table.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario2Table/"
+
+  ExecuteCreateScenario2UndoTable:
+    Type: "Custom::ExecuteCreateScenario2UndoTableFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateScenario2Table
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateScenario2UndoTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario2UndoTable/"
+
+  ExecuteCreateScenario3aTable:
+    Type: "Custom::ExecuteCreateScenario3aTableFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateChangedKeysTable
+    - ExecuteCreateCountVersionsTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateScenario3aTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario3aTable/"
+
+  ExecuteCreateScenario3bTable:
+    Type: "Custom::ExecuteCreateScenario3bTableFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateChangedKeysTable
+    - ExecuteCreateCountVersionsTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateScenario3bTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario3bTable/"
+
+  ExecuteCreateScenario3cTable:
+    Type: "Custom::ExecuteCreateScenario3cViewTable"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateChangedKeysTable
+    - ExecuteCreateCountVersionsTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateScenario3cTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario3cTable/"
+
+  ExecuteManifestMaker:
+    Type: "Custom::ExecuteManifestMakerFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateScenario1Table
+    - ExecuteCreateScenario2Table
+    - ExecuteCreateScenario2UndoTable
+    - ExecuteCreateScenario3aTable
+    - ExecuteCreateScenario3bTable
+    - ExecuteCreateScenario3cTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt ManifestMaker.Arn
+      SourceBucket: !Ref AthenaResultsBucket
+      TableSource: Tables/
+      ManifestDestination: Manifests/
+      Tables:
+        - scenario1
+        - scenario2
+        - scenario2_undo
+        - scenario3a
+        - scenario3b
+        - scenario3c
 
   ExecuteS3BatchOpsDeleteCreator1:
     Type: "Custom::ExecuteS3BatchOpsCreator"
