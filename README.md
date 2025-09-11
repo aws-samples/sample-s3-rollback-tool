@@ -229,7 +229,7 @@ KMS permissions are *not* required for the scenario 1 and 2 jobs, as DELETE oper
 7. I have objects in my bucket with `null` version IDs from when S3 Versioning was disabled or suspended. Will this tool still work?
     - Yes, the tool will correctly copy objects and delete delete markers that have a `null` version ID. Versioning must be enabled when this tool is deployed. When versioning is suspended, objects and delete markers are written with `null` version IDs, and will permanently and immediately overwrite any existing object with the same version ID.
 8. I only want to remove delete markers, not any PUT operations. Is this tool still useful?
-    - In some circumstances, yes. If there is a point in time after all revelent objects were PUT, but before delete markers were placed on top, you can use that timestamp. Do not automatically start the S3 Batch Operations jobs, and then only run the Scenario 2 job. If you would like this tool to create an additional manifest of all current-version delete markers, please upvote the revelent issue.
+    - In some circumstances, yes. If there is a point in time after all relevent objects were PUT, but before delete markers were placed on top, you can use that timestamp. Do not automatically start the S3 Batch Operations jobs, and then only run the Scenario 2 job. If you would like this tool to create an additional manifest of all current-version delete markers, please upvote the relevent issue.
 
 
 ## Charges
