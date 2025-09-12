@@ -1,3 +1,5 @@
+>  **Disclaimer:** Code is provided as-is, to demonstrate a concept or workflow to AWS customers. You should ensure it meets your requirements, and carefully review the S3 Batch Operations manifests and tasks before running any jobs.
+
 # Rollback tool for Amazon S3
 
 #### Within-bucket recovery using S3 Versioning, to a specified point-in-time, at scale.
@@ -206,6 +208,8 @@ KMS permissions are *not* required for the scenario 1 and 2 jobs, as DELETE oper
 
 **This tool does not assign [reserved concurrency](https://docs.aws.amazon.com/lambda/latest/dg/configuration-concurrency.html)** to the Lambda functions it creates, and may consume all the available [Lambda concurrent execution quota](https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html#compute-and-storage). **If you have concerns about this, review the S3 Batch Operations tasks that use Lambda (scenarios 3b and 3c), and [adjust the Lambda functions accordingly](https://docs.aws.amazon.com/lambda/latest/dg/configuration-concurrency.html#configuring-concurrency-reserved) before running the jobs**. We made this design decision because 1/ at the time the functions are created the tool does not know the number of objects (if any) in scope for scenarios 3b or 3c, 2/ we don't know the lambda concurrent execution quota, or how much it is appropriate to consume, and 3/ when a function has reserved concurrency, no other function can use that concurrency. Any reservation assigned by the tool would have been held until the CloudFormation stack was deleted.
 
+The lambda functions created by this tool (for use with S3 Batch Operations) have been tested with up to 1000 concurrent executions - the default quota for new AWS Accounts.
+
 
 ## FAQs
 
@@ -281,4 +285,4 @@ See [CONTRIBUTING](CONTRIBUTING.md) for more information.
 
 ## License
 
-This library is licensed under the MIT-0 License. See the [LICENSE](license) file.
+This library is licensed under the MIT-0 License. See the [LICENSE](LICENSE) file.
