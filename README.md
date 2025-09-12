@@ -229,14 +229,19 @@ KMS permissions are *not* required for the scenario 1 and 2 jobs, as DELETE oper
 7. I have objects in my bucket with `null` version IDs from when S3 Versioning was disabled or suspended. Will this tool still work?
     - Yes, the tool will correctly copy objects and delete delete markers that have a `null` version ID. Versioning must be enabled when this tool is deployed. When versioning is suspended, objects and delete markers are written with `null` version IDs, and will permanently and immediately overwrite any existing object with the same version ID.
 8. I only want to remove delete markers, not any PUT operations. Is this tool still useful?
-    - In some circumstances, yes. If there is a point in time after all relevent objects were PUT, but before delete markers were placed on top, you can use that timestamp. Do not automatically start the S3 Batch Operations jobs, and then only run the Scenario 2 job. If you would like this tool to create an additional manifest of all current-version delete markers, please upvote the relevent issue.
+    - In some circumstances, yes. If there is a point in time after all relevent objects were PUT, but before delete markers were placed on top, you can use that timestamp. Do not automatically start the S3 Batch Operations jobs, and then only run the scenario 2 job. 
+        - For example, if a lifecycle rule was created on day 0 to expire current versions 30 days after they were created:
+            - On day 1, delete markers will start to be placed on objects with a `last_modified` of day -30 and earlier.
+            - By day 21, delete markers will be placed on objects with a `last_modified` of day -10 and earlier.
+            - On day 29, the situation can still be recovered: Disable the lifecycle rule, collect an updated inventory, use it to roll back to day 0, and only run the scenario 2 job. This will delete all delete markers created by the lifecycle rule. It will also delete any delete markers placed for any other reason between day 0 and day 29, so you may wish to edit the scenario 2 manifest prior to running the job.
+        - If you would like this tool to create an additional manifest of all current-version delete markers, please upvote the relevent issue.
 
 
 ## Charges
 
 S3 Batch Operations charges per object as well as per job. Rollback COPY requests incur the usual S3 charges, while DELETE requests have no cost other than for the Lambda compute to initiate them. Amazon Athena charges scale with the number of objects in scope (and therefore bytes scanned).
 
-For example, if you use this tool against an entire bucket in us-east-1 containing 1 billion objects, and with an existing Amazon S3 Inventory, to roll back 1 million non-overwrite PUTs, 1 million overwrite PUTs (of objects in Standard or Intelligent-Tiering classes`*`) and 1 million DELETEs since the desired point-in-time, **the total cost would be approximately $12** ($1 Athena, $5 S3 PUTs, $4 S3 Batch Operations, $2 Lambda). The [simple demo](#simple-demo) above costs approximately $0.75.
+For example, if you use this tool against an entire bucket in us-east-1 containing 1 billion objects, and with an existing Amazon S3 Inventory, to roll back 1 million non-overwrite PUTs, 1 million overwrite PUTs (of objects in Standard or Intelligent-Tiering classes`*`) and 1 million DELETEs since the desired point-in-time, **the total cost would be approximately $12** ($1 Athena, $5 S3 PUTs, $4 S3 Batch Operations, $2 Lambda). Following the [simple demo](#simple-demo) above costs $1.
 
 `*` These S3 storage classes do not incur a per-GB retrieval charge when copied. Additional storage charges for copies are not included in the above estimates.
 
