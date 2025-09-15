@@ -24,7 +24,7 @@ The tool will not delete any data - it works by adding and removing delete marke
 
 3. A current inventory of the bucket is required. This can be provided manually (see the section [Creating a real-time inventory using the ListObjectVersions API](#creating-a-real-time-inventory-using-the-listobjectversions-api)), or the tool can detect and use an existing [S3 Inventory](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html). Soon it will also support [S3 Metadata live inventory tables](https://docs.aws.amazon.com/AmazonS3/latest/userguide/metadata-tables-overview.html).
      
-    - S3 Inventory report are supported in [Parquet or Apache ORC](https://docs.aws.amazon.com/athena/latest/ug/columnar-storage.html) format, when including all versions as well as all [additional metadata](https://docs.aws.amazon.com/AmazonS3/latest/userguide/configure-inventory.html#configure-inventory-console). They must not be stored with [KMS encryption](https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingKMSEncryption.html). See [Deployment workflow](#deployment-workflow) for additional detail.
+    - S3 Inventory reports are supported in [Parquet or Apache ORC](https://docs.aws.amazon.com/athena/latest/ug/columnar-storage.html) format, when including all versions as well as all [additional metadata](https://docs.aws.amazon.com/AmazonS3/latest/userguide/configure-inventory.html#configure-inventory-console). They must not be stored with [KMS encryption](https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingKMSEncryption.html). See [Deployment workflow](#deployment-workflow) for additional detail.
 
 4. **The operations you want to roll back must be included in the inventory**. S3 Inventory reports are delivered daily (or weekly) and are eventually consistent and might not include recently added or deleted objects. This can add more than a day to the start of your recovery time. 
 
@@ -104,9 +104,9 @@ The tool requires an inventory of the bucket or prefix in scope. If none is avai
 
 The CloudFormation template creates the following resources:
 
-* An S3 bucket to store Athena output (known as the solution bucket), associated [AWS Glue database](https://docs.aws.amazon.com/glue/latest/dg/define-database.html), Athena [workgroup](https://docs.aws.amazon.com/athena/latest/ug/workgroups-create-update-delete.html) and [tables](https://docs.aws.amazon.com/athena/latest/ug/creating-tables.html), plus S3 Batch Operations manifests and reports.
+* A temporary S3 bucket to store Athena output, associated [AWS Glue database](https://docs.aws.amazon.com/glue/latest/dg/define-database.html), Athena [workgroup](https://docs.aws.amazon.com/athena/latest/ug/workgroups-create-update-delete.html) and [tables](https://docs.aws.amazon.com/athena/latest/ug/creating-tables.html), plus S3 Batch Operations manifests and reports.
    - By default, new S3 buckets have [Block Public Access](https://aws.amazon.com/s3/features/block-public-access/) enabled and [new objects are encrypted at rest with SSE-S3](https://docs.aws.amazon.com/AmazonS3/latest/userguide/default-encryption-faq.html).
-* Lambda functions to create the above resources, check versioning is enabled, determine which inventory to use, orchestrate Athena queries, create manifests in the correct formats, create S3 Batch Operations jobs, and clean up the solution bucket when the CloudFormation stack is deleted.
+* Lambda functions to create the above resources, check versioning is enabled, determine which inventory to use, orchestrate Athena queries, create manifests in the correct formats, create S3 Batch Operations jobs, and clean up the temporary S3 bucket when the CloudFormation stack is deleted.
 * IAM roles for use by the tool.
 
 
