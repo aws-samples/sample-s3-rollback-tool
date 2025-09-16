@@ -8,7 +8,7 @@ If you want to revert lots of changes to a dataset in Amazon S3, as quickly as p
 
 It can also revert a few thousand changes in a smaller bucket (up to millions of objects) in under 15 minutes end-to-end, including real-time inventory creation.
 
- Unlike other solutions, it does not require anything (other then versioning) to be in place prior to the undesired event. See [Prerequisites](#prerequisites).
+ Unlike other solutions, it does not require anything to be in place prior to the undesired event, other then [S3 Versioning](readme.md). See [Prerequisites](#prerequisites).
 
 [Watch the demo here:](https://www.youtube.com/watch?v=2XR2trZvv7w) [![Recorded demo of the tool](https://img.youtube.com/vi/2XR2trZvv7w/mqdefault.jpg)](https://www.youtube.com/watch?v=2XR2trZvv7w)
 
