@@ -12,7 +12,7 @@ It can also revert a few thousand changes in a smaller bucket (up to millions of
 
 [Watch the demo here:](https://www.youtube.com/watch?v=2XR2trZvv7w) [![Recorded demo of the tool](https://img.youtube.com/vi/2XR2trZvv7w/mqdefault.jpg)](https://www.youtube.com/watch?v=2XR2trZvv7w)
 
-Undesired ‘soft DELETE’, ‘overwrite PUT’ and ‘non-overwrite PUT’ operations are all in scope - **you choose which of these to revert**. Changes to storage class (by S3 Lifecycle) or to Object Tags are not in scope, as these do not create new object versions.
+Undesired ‘soft DELETE’, ‘overwrite PUT’ and ‘non-overwrite PUT’ operations are all in scope - **you choose which of these to revert**. Changes to storage class (by [S3 Lifecycle](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-transition-general-considerations.html)) or to [object tags](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-tagging.html) are not in scope, as these do not create new object versions.
 
 The tool will not delete any data - it works by adding and removing delete markers, and copying object versions where necessary, to  revert a dataset to an earlier time with the fewest possible operations.
 
@@ -241,7 +241,7 @@ The Lambda functions created by this tool (for use with S3 Batch Operations) hav
     - Yes, the tool will correctly copy objects and delete delete markers that have a `null` version ID. Versioning must be enabled when this tool is deployed. When versioning is suspended, objects and delete markers are written with `null` version IDs, and will permanently and immediately overwrite any existing object with the same version ID.
 8. I only want to remove delete markers, not any PUT operations. Is this tool still useful?
     - In some circumstances, yes. If there is a point in time after all relevent objects were PUT, but before delete markers were placed on top, you can use that timestamp. Do not automatically start the S3 Batch Operations jobs, and then only run the scenario 2 job. 
-        - For example, if a lifecycle rule was created on day 0 to expire current versions 30 days after they were created:
+        - For example, if a [lifecycle rule](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-expire-general-considerations.html) was created on day 0 to expire current versions 30 days after they were created:
             - On day 1, delete markers will start to be placed on objects with a `last_modified` of day -30 and earlier.
             - By day 21, delete markers will be placed on objects with a `last_modified` of day -10 and earlier.
             - On day 29, the situation can still be recovered: Disable the lifecycle rule, collect an updated inventory, use it to roll back to day 0, and only run the scenario 2 job. This will delete all delete markers created by the lifecycle rule. It will also delete any delete markers placed for any other reason between day 0 and day 29, so you may wish to edit the scenario 2 manifest prior to running the job.
