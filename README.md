@@ -4,11 +4,13 @@
 
 #### Within-bucket recovery using S3 Versioning, to a specified point-in-time, at scale.
 
-If you want to revert lots of changes to a dataset in Amazon S3, as quickly as possible, this tool is for you. It can detect and revert 1 million changes, in a bucket containing 10 billion objects, in under 1 hour, and 100 million changes in under 15 hours.
+If you want to revert lots of changes to a dataset in Amazon S3, as quickly as possible, this tool is for you. It can detect and revert 1 million changes, in a bucket containing 10 billion objects, in under 1 hour. Or 100 million changes in under 15 hours.
 
-It can also revert a few thousand changes in a smaller bucket (up to millions of objects) in under 15 minutes end-to-end, including real-time inventory creation. **[Watch a recorded demo of this here](https://www.youtube.com/watch?v=2XR2trZvv7w).**
+It can also revert a few thousand changes in a smaller bucket (up to millions of objects) in under 15 minutes end-to-end, including real-time inventory creation.
 
-[![Recorded demo of the tool](https://img.youtube.com/vi/2XR2trZvv7w/mqdefault.jpg)](https://www.youtube.com/watch?v=2XR2trZvv7w)
+ Unlike other solutions, it does not require anything (other then versioning) to be in place prior to the undesired event. See [Prerequisites](#prerequisites).
+
+[Watch the demo here:](https://www.youtube.com/watch?v=2XR2trZvv7w) [![Recorded demo of the tool](https://img.youtube.com/vi/2XR2trZvv7w/mqdefault.jpg)](https://www.youtube.com/watch?v=2XR2trZvv7w)
 
 Undesired ‘soft DELETE’, ‘overwrite PUT’ and ‘non-overwrite PUT’ operations are all in scope - **you choose which of these to revert**. Changes to storage class (by S3 Lifecycle) or to Object Tags are not in scope, as these do not create new object versions.
 
@@ -220,8 +222,7 @@ The Lambda functions created by this tool (for use with S3 Batch Operations) hav
 ## FAQs
 
 1. What did I need to have in place prior to an event that I want to recover from, in order to use this tool?
-    - S3 Versioning must have been enabled before the time of the event. Object versions cannot be recovered if they have since been permanently deleted (either directly or by a lifecycle rule).
-    - If you have used S3 Replication to make a copy of your data in another bucket, you could use this tool on either bucket. Note that that permanent delete operations (including of delete markers) are not replicated, and replication of new delete markers is [optional](https://docs.aws.amazon.com/AmazonS3/latest/userguide/delete-marker-replication.html).
+    - S3 Versioning must have been enabled before the time of the event. Object versions cannot be recovered if they have since been permanently deleted (either directly or by a lifecycle rule). See [Prerequisites](#prerequisites).
     - If you don’t have an S3 Inventory from after the event, you will need to enable this and wait for it to create an inventory of your S3 bucket. Or you can LIST the contents of your bucket into a CSV - see [**Creating a real-time inventory using the ListObjectVersions API**](#creating-a-real-time-inventory-using-the-listobjectversions-api).
 2. What about changes that took place after the inventory was created, or after the rollback process was started?
     - This tool will take the appropriate action to revert changes, based on the available inventory information at the time of deployment. The impact of a subsequent change depends on its nature, and whether it took place before or after the specific S3 Batch Operations job (created  by this rollback tool) took its action. However, in all cases, running the rollback tool *again*, with an inventory that includes new changes, will correctly revert the new changes. Note: If the new inventory includes copies made by this tool (scenario 3), those copies will be repeated as it isn't possible to tell from an inventory that the current object version's data is identical to the desired version.
@@ -245,6 +246,9 @@ The Lambda functions created by this tool (for use with S3 Batch Operations) hav
             - By day 21, delete markers will be placed on objects with a `last_modified` of day -10 and earlier.
             - On day 29, the situation can still be recovered: Disable the lifecycle rule, collect an updated inventory, use it to roll back to day 0, and only run the scenario 2 job. This will delete all delete markers created by the lifecycle rule. It will also delete any delete markers placed for any other reason between day 0 and day 29, so you may wish to edit the scenario 2 manifest prior to running the job.
         - If you would like this tool to create an additional manifest of all current-version delete markers, please upvote the relevent issue.
+9. Does this work with S3 Replication?
+    - Yes. If you have used S3 Replication to make a copy of your data in another bucket, you could use this tool to revert either the source or destination bucket.
+        - Note that that permanent delete operations (including of delete markers) are not replicated, and replication of new delete markers is [optional](https://docs.aws.amazon.com/AmazonS3/latest/userguide/delete-marker-replication.html).
 
 
 ## Charges
