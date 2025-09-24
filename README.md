@@ -199,7 +199,7 @@ For a simple demonstration example, costing $0.75-$1.00 (for the three to four S
 
 [Amazon S3](https://aws.amazon.com/s3/) is an object storage service with industry-leading scalability, data availability, security, performance, and 99.999999999% (11 9s) of data durability. [S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html) protects against accidental deletions and overwrites by keeping multiple variants of an object in the same S3 bucket, and placing a [delete marker as the current version in response to simple DELETE requests](https://docs.aws.amazon.com/AmazonS3/latest/userguide/DeletingObjectVersions.html) (i.e. without specifying a VersionID). 
 
-To return the state of a dataset to an earlier time, this tool adds delete markers and copies desired versions of objects. **These desired versions must still exist**. Users can prevent the deletion of specific versions in Amazon S3 by denying use of the [DeleteObjectVersion](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html) API with [bucket policies](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-policies.html), [access point policies](https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-points-policies.html), [service control policies (SCPs)](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_scps.html), or [resource control policies (RCPs)](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_rcps.html), and/or by using [S3 Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html). For a complementary solution to assist with this, see [**Maintaining object immutability by automatically extending Amazon S3 Object Lock retention periods**](https://aws.amazon.com/blogs/storage/maintaining-object-immutability-by-automatically-extending-amazon-s3-object-lock-retention-periods/). You can also use [S3 Replication](https://docs.aws.amazon.com/AmazonS3/latest/userguide/replication.html) to make and maintain a copy of your data in another bucket.
+To return the state of a dataset to an earlier time, this tool adds delete markers and copies desired versions of objects. **These desired versions must still exist**. Administrators can prevent the deletion of specific versions in Amazon S3 by denying use of the [DeleteObjectVersion](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html) and [PutLifeCycleConfiguration](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketLifecycleConfiguration.html) APIs with [bucket policies](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-policies.html), [access point policies](https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-points-policies.html), [service control policies (SCPs)](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_scps.html), or [resource control policies (RCPs)](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_rcps.html), and/or by using [S3 Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html). For a complementary solution to assist with this, see [**Maintaining object immutability by automatically extending Amazon S3 Object Lock retention periods**](https://aws.amazon.com/blogs/storage/maintaining-object-immutability-by-automatically-extending-amazon-s3-object-lock-retention-periods/). You can also use [S3 Replication](https://docs.aws.amazon.com/AmazonS3/latest/userguide/replication.html) to make and maintain a copy of your data in another bucket (see [FAQ #9](#faqs)).
 
 
 ## KMS permissions
@@ -232,7 +232,7 @@ The Lambda functions created by this tool (for use with S3 Batch Operations) hav
       2. Once the above is complete, you need to re-create any delete markers created by the original deployment, as the updated inventory has no knowledge of these. To do this, create an S3 Batch Operations job, choose the CSV manifest `scenario2-undo.csv` from the *original deployment*, leaving **Manifest includes version IDs** unchecked. Choose **Invoke AWS Lambda function** as the operation type, the function titled `<original stack name>-S3BatchOpsDeleteFunction-<unique-id>` (you can find this name in the **Resources** output of the deployment) and **Invocation schema version 2.0**. Run the job with the role titled `<original stack name>-S3BatchOpsExecutorRole--<unique-id>`.
 4. What happens when I delete the CloudFormation stack?
     - Any S3 Batch Operations jobs not in COMPLETE state will be cancelled.
-    - All created resources will be deleted, including the temporary S3 and S3 Tables buckets.
+    - All created resources will be deleted, including the temporary S3 bucket.
 5. I don’t want to delete delete markers, but instead copy the desired object version to the top of the version stack.
     - As this increases both cost and time, delete markers contain no data, and deletion of delete markers is reversible, we made the decision not to prioritize providing this as an option. We may consider adding this capability based on feedback - see [Issues](https://github.com/aws-samples/sample-s3-rollback-tool/issues).
 6. I have [ACLs enabled](https://docs.aws.amazon.com/AmazonS3/latest/userguide/ensure-object-ownership.html) on my bucket, can I still use this tool?
@@ -247,8 +247,14 @@ The Lambda functions created by this tool (for use with S3 Batch Operations) hav
             - On day 29, the situation can still be recovered: Disable the lifecycle rule, collect an updated inventory, use it to roll back to day 0, and only run the scenario 2 job. This will delete all delete markers created by the lifecycle rule. It will also delete any delete markers placed for any other reason between day 0 and day 29, so you may wish to edit the scenario 2 manifest prior to running the job.
         - If you would like this tool to create an additional manifest of all current-version delete markers, please upvote the relevent issue.
 9. Does this work with S3 Replication?
-    - Yes. If you have used S3 Replication to make a copy of your data in another bucket, you could use this tool to revert either the source or destination bucket.
-        - Note that that permanent delete operations (including of delete markers) are not replicated, and replication of new delete markers is [optional](https://docs.aws.amazon.com/AmazonS3/latest/userguide/delete-marker-replication.html).
+    - Yes. If you have used S3 Replication to make a copy of your data in another bucket, you could use this tool to revert either the source or destination bucket. Note that permanent delete operations (including of delete markers) are not replicated, and replication of new delete markers is [optional](https://docs.aws.amazon.com/AmazonS3/latest/userguide/delete-marker-replication.html).
+    1. If you want to roll back both source and destination buckets:
+        1. Ensure replication of delete markers is enabled in your replication rule.
+        2. Roll back the source bucket to tD, running all Batch Operations jobs. The operations carried out by the Scenario 1 and 3 jobs will be replicated.
+        3. Roll back the destination bucket to tD, running only the Scenario 2 job, as these operations will *not* have been replicated.
+    2. If you only want to roll back the destination (if, for example, you are failing over to using the destination bucket):
+        1. [Disable the replication rule](https://docs.aws.amazon.com/AmazonS3/latest/userguide/replication-add-config.html#replication-config-min-rule-config) to prevent further replication from source to destination.
+        2. Using an inventory from after this, roll back the destination bucket to tD.
 
 
 ## Charges
@@ -266,7 +272,7 @@ Amazon S3 pricing is available at [https://aws.amazon.com/s3/pricing](https://aw
 
 As the tool is deployed once per use, it should be removed once the jobs are complete and the reports are no longer required.
 
-To do this, delete the CloudFormation stack. This will delete any CSV manifests generated by the tool, as well as all the resources it created.
+To clean up, delete the CloudFormation stack. This will delete any CSV manifests generated by the tool, as well as all the resources it created.
 
 ## Tenets
 
