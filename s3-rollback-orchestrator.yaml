@@ -1,0 +1,2404 @@
+Description: >-
+  Orchestrator for batch S3 rollback operations. Reads a CSV from S3, creates a child
+  CloudFormation stack per row using s3-rollback.yaml in the selected execution mode,
+  and produces a results CSV. See https://github.com/aws-solutions-library-samples/sample-s3-rollback-tool/
+
+Parameters:
+
+  S3CsvUrl:
+    Type: String
+    Description: >-
+      S3 URL of the input CSV file. Accepts s3:// and https:// formats.
+      The CSV has three columns: Bucket Name (required), Prefix (optional, leave blank
+      to roll back the whole bucket), and KMS Key (optional, ARN or key ID of the
+      customer managed key used to encrypt the bucket's S3 Metadata tables - leave
+      blank if the metadata tables use SSE-S3 encryption). A header row is optional.
+      See example-buckets.csv in the repository for a ready-to-use template.
+    AllowedPattern: '^(s3://|https://).+\.csv$'
+    ConstraintDescription: Please enter a valid S3 URL ending in .csv (s3:// or https:// format).
+
+  TemplateS3Url:
+    Type: String
+    Description: >-
+      HTTPS URL of the s3-rollback.yaml template in S3.
+    AllowedPattern: "^https://.*\\.yaml$"
+    ConstraintDescription: Please enter a valid HTTPS URL ending in .yaml.
+
+  ResultsBucket:
+    Type: String
+    Description: >-
+      S3 bucket where the orchestrator writes its results CSV under the key prefix 'results/'.
+      Each child stack creates its own temporary S3 bucket for Athena query results, manifests,
+      and S3 Batch Operations reports.
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    ConstraintDescription: Please enter a valid S3 bucket name.
+
+  TimeStamp:
+    Type: String
+    Description: >-
+      Rollback point-in-time in UTC ISO format (yyyy-mm-ddThh:mm:ss).
+      All child stacks use this timestamp for their rollback operations.
+    AllowedPattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$'
+    ConstraintDescription: Please enter a timestamp in ISO format (e.g. 2025-08-30T02:00:00).
+    Default: "2025-08-30T02:00:00"
+
+  Mode:
+    Type: String
+    Description: >-
+      Execution mode for all child stacks. Determines the type of S3 rollback operation.
+      'Copy to Bucket' mode is not supported by the orchestrator because it requires a
+      per-bucket copy target; use s3-rollback.yaml directly for per-bucket copies.
+    AllowedValues:
+      - "Bucket Rollback"
+      - "Delete Marker Removal"
+    Default: "Delete Marker Removal"
+    ConstraintDescription: Please choose one of Bucket Rollback or Delete Marker Removal.
+
+  StartS3BatchOperationsJobs:
+    Type: String
+    Description: >-
+      Whether to automatically start S3 Batch Operations jobs created by child stacks.
+      If NO (default), jobs are created in a paused state.
+    AllowedValues:
+      - "YES"
+      - "NO"
+    Default: "NO"
+    ConstraintDescription: Please select YES or NO.
+
+  CreateSharedIAMRole:
+    Type: String
+    Description: >-
+      Create a single shared IAM role for use by all child stacks. Reduces IAM role count
+      when processing many buckets. Ignored if SharedIAMRoleArn is provided.
+    AllowedValues:
+      - "YES"
+      - "NO"
+    Default: "YES"
+    ConstraintDescription: Please select YES or NO.
+
+  SharedIAMRoleArn:
+    Type: String
+    Description: >-
+      ARN of a pre-existing IAM role for all child stacks to use. When provided, child
+      stacks skip creating their own roles. Takes precedence over CreateSharedIAMRole.
+    AllowedPattern: '^(arn:(aws|aws-cn|aws-us-gov):iam::\d{12}:role/.+|)$'
+    ConstraintDescription: Please enter a valid IAM role ARN or leave blank.
+    Default: ""
+
+  SNSEmailList:
+    Type: String
+    AllowedPattern: '^$|^\s*[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}(\s*,\s*[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})*\s*$'
+    ConstraintDescription: 'Must be empty or a comma-separated list of valid email addresses, such as admin@example.com,security@example.com.'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "S3 Rollback Orchestrator"
+        Parameters:
+          - S3CsvUrl
+          - TemplateS3Url
+          - ResultsBucket
+          - TimeStamp
+          - Mode
+          - StartS3BatchOperationsJobs
+          - CreateSharedIAMRole
+      -
+        Label:
+          default: "Optional parameters"
+        Parameters:
+          - SharedIAMRoleArn
+          - SNSEmailList
+
+
+    ParameterLabels:
+      S3CsvUrl:
+        default: Buckets to roll back
+      TemplateS3Url:
+        default: Rollback Template S3 URL
+      ResultsBucket:
+        default: Results Bucket
+      TimeStamp:
+        default: Rollback Timestamp
+      Mode:
+        default: Execution Mode
+      StartS3BatchOperationsJobs:
+        default: Start S3 Batch Operations Jobs
+      CreateSharedIAMRole:
+        default: Create Shared IAM Role
+      SharedIAMRoleArn:
+        default: Shared IAM Role ARN (existing)
+      SNSEmailList:
+        default: Optional comma-separated list of email recipients that will be subscribed to SNS notifications for orchestrator failures.
+
+Conditions:
+  HasExistingSharedRole: !Not [!Equals [!Ref SharedIAMRoleArn, ""]]
+  ShouldCreateSharedRole: !And
+    - !Equals [!Ref CreateSharedIAMRole, "YES"]
+    - !Not [!Condition HasExistingSharedRole]
+  ShouldNotCreateSharedRole: !Not [!Condition ShouldCreateSharedRole]
+  HasSNSEmailList: !Not [!Equals [!Ref SNSEmailList, ""]]
+  HasNoSNSEmailList: !Equals [!Ref SNSEmailList, ""]
+
+Resources:
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+          # Allow child stack roles to assume this role for LF admin operations.
+          # The LFPermissionsGranter Lambda in child stacks assumes this role
+          # via STS to make LF grants as a data lake administrator.
+          # Includes s3-rollback-* (per-stack roles), the orchestrator's own
+          # shared child execution role, and any user-provided SharedIAMRoleArn.
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: sts:AssumeRole
+            Condition:
+              ArnLike:
+                aws:PrincipalArn:
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/s3-rollback-*"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-child-execution-role"
+                  - !If
+                    - HasExistingSharedRole
+                    - !Ref SharedIAMRoleArn
+                    - !Ref "AWS::NoValue"
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # S3 - read input CSV, check bucket existence, write results;
+              # CFN also creates/deletes the child stack's AthenaResultsBucket
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:HeadBucket"
+                  - "s3:CreateBucket"
+                  - "s3:DeleteBucket"
+                  - "s3:PutBucketPublicAccessBlock"
+                  - "s3:PutEncryptionConfiguration"
+                  - "s3:GetEncryptionConfiguration"
+                  - "s3:PutBucketPolicy"
+                  - "s3:GetBucketPolicy"
+                  - "s3:DeleteBucketPolicy"
+                  - "s3:PutBucketTagging"
+                  - "s3:GetBucketTagging"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${ResultsBucket}/results/*"
+              # Read per-child Distributed Map result files and manifest written by
+              # the state machine's ResultWriter. ResultsWriterFunction loads these
+              # to build the final consolidated CSV.
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${ResultsBucket}/intermediate/*"
+              - Effect: Allow
+                Action:
+                  - "s3:ListBucket"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${ResultsBucket}"
+              # CloudFormation - manage child stacks (named s3-rollback-*)
+              - Effect: Allow
+                Action:
+                  - "cloudformation:CreateStack"
+                  - "cloudformation:DescribeStacks"
+                  - "cloudformation:DeleteStack"
+                  - "cloudformation:DescribeStackEvents"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/s3-rollback-*/*"
+              - Effect: Allow
+                Action:
+                  - "cloudformation:ListStacks"
+                Resource: "*"
+              # IAM - CFN needs these to create/delete roles in child stacks (when no shared role is used)
+              - Effect: Allow
+                Action:
+                  - "iam:CreateRole"
+                  - "iam:DeleteRole"
+                  - "iam:GetRole"
+                  - "iam:PutRolePolicy"
+                  - "iam:DeleteRolePolicy"
+                  - "iam:GetRolePolicy"
+                  - "iam:AttachRolePolicy"
+                  - "iam:DetachRolePolicy"
+                  - "iam:TagRole"
+                  - "iam:UntagRole"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/s3-rollback-*"
+              # IAM - pass roles to child stack Lambdas and S3 Batch Operations
+              - Effect: Allow
+                Action:
+                  - "iam:PassRole"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/s3-rollback-*"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-child-execution-role"
+              # Glue - CFN creates databases/tables in child stacks
+              - Effect: Allow
+                Action:
+                  - "glue:CreateDatabase"
+                  - "glue:DeleteDatabase"
+                  - "glue:GetDatabase"
+                  - "glue:CreateTable"
+                  - "glue:DeleteTable"
+                  - "glue:GetTable"
+                  - "glue:GetTables"
+                  - "glue:UpdateTable"
+                  - "glue:GetUserDefinedFunctions"
+                  - "glue:DeleteUserDefinedFunction"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/s3_rollback_*"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/s3_rollback_*/*"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:userDefinedFunction/s3_rollback_*/*"
+              # Glue - GetDatabase on all databases needed for LF grant validation
+              # when LFPermissionsGranter runs as this role (LFAdminRoleArn path).
+              # LF checks Glue IAM permissions even for LF admins when granting on
+              # S3 Tables catalog namespaces, which use non-s3_rollback_* names.
+              - Effect: Allow
+                Action:
+                  - "glue:GetDatabase"
+                  - "glue:GetTable"
+                  - "glue:GetCatalog"
+                Resource: "*"
+              # S3 Tables - needed when LFPermissionsGranter runs as this role
+              # (LFAdminRoleArn path) to make LF grants on S3 Tables catalog namespaces.
+              - Effect: Allow
+                Action:
+                  - "s3tables:GetTableBucket"
+                  - "s3tables:GetNamespace"
+                  - "s3tables:ListNamespaces"
+                  - "s3tables:ListTables"
+                Resource: "*"              # Athena - CFN creates workgroups and named queries; child Lambdas run queries
+              - Effect: Allow
+                Action:
+                  - "athena:CreateWorkGroup"
+                  - "athena:DeleteWorkGroup"
+                  - "athena:UpdateWorkGroup"
+                  - "athena:GetWorkGroup"
+                  - "athena:TagResource"
+                  - "athena:CreateNamedQuery"
+                  - "athena:DeleteNamedQuery"
+                  - "athena:GetNamedQuery"
+                  - "athena:StartQueryExecution"
+                  - "athena:GetQueryExecution"
+                  - "athena:GetQueryResults"
+                Resource: "*"
+              # Lambda - CFN creates/deletes functions in child stacks
+              - Effect: Allow
+                Action:
+                  - "lambda:CreateFunction"
+                  - "lambda:DeleteFunction"
+                  - "lambda:GetFunction"
+                  - "lambda:GetFunctionConfiguration"
+                  - "lambda:AddPermission"
+                  - "lambda:RemovePermission"
+                  - "lambda:InvokeFunction"
+                  - "lambda:UpdateFunctionCode"
+                  - "lambda:UpdateFunctionConfiguration"
+                  - "lambda:TagResource"
+                  - "lambda:UntagResource"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:s3-rollback-*"
+              # LakeFormation - child stacks set admins and grant permissions
+              - Effect: Allow
+                Action:
+                  - "lakeformation:GetDataLakeSettings"
+                  - "lakeformation:PutDataLakeSettings"
+                  - "lakeformation:GetDataAccess"
+                  - "lakeformation:GrantPermissions"
+                  - "lakeformation:RevokePermissions"
+                Resource: "*"
+              # CloudWatch Logs - Lambda execution logging
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "logs:TagResource"
+                  - "logs:TagLogGroup"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*:*"
+              # Step Functions - auto-start triggers the orchestrator;
+              # cleanup-trigger starts the cleanup state machine on stack deletion.
+              - Effect: Allow
+                Action:
+                  - "states:StartExecution"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-orchestrator"
+                  - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-cleanup"
+              # Step Functions - cleanup-trigger polls and may abort the cleanup execution.
+              - Effect: Allow
+                Action:
+                  - "states:DescribeExecution"
+                  - "states:StopExecution"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:execution:${AWS::StackName}-cleanup:*"
+              # SNS - subscribe emails and publish notifications
+              - Effect: Allow
+                Action:
+                  - "sns:Subscribe"
+                  - "sns:Publish"
+                Resource: "*"
+
+  ChildStackExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: ShouldCreateSharedRole
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-child-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - batchoperations.s3.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ChildStackExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # CloudWatch Logs
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              # S3 - data plane operations on target buckets
+              - Effect: Allow
+                Action:
+                  - "s3:HeadBucket"
+                  - "s3:GetBucketVersioning"
+                  - "s3:GetBucketMetadataTableConfiguration"
+                  - "s3:GetInventoryConfiguration"
+                  - "s3:GetBucketLocation"
+                  - "s3:ListBucket"
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:GetObjectTagging"
+                  - "s3:PutObject"
+                  - "s3:PutObjectTagging"
+                  - "s3:DeleteObject"
+                  - "s3:DeleteObjectVersion"
+                  - "s3:HeadObject"
+                  - "s3:CopyObject"
+                Resource: "*"
+              # S3 Batch Operations
+              - Effect: Allow
+                Action:
+                  - "s3:CreateJob"
+                  - "s3:UpdateJobStatus"
+                  - "s3:DescribeJob"
+                Resource: "*"
+              # IAM - pass self to S3 Batch Operations
+              - Effect: Allow
+                Action:
+                  - "iam:PassRole"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-child-execution-role"
+              # Athena - query execution
+              - Effect: Allow
+                Action:
+                  - "athena:GetNamedQuery"
+                  - "athena:StartQueryExecution"
+                  - "athena:GetQueryExecution"
+                  - "athena:GetQueryResults"
+                  - "athena:GetDataCatalog"
+                  - "athena:GetWorkGroup"
+                Resource: "*"
+              # Glue - catalog access for Athena queries
+              - Effect: Allow
+                Action:
+                  - "glue:GetDatabase"
+                  - "glue:GetTable"
+                  - "glue:GetTables"
+                  - "glue:GetCatalog"
+                  - "glue:GetPartitions"
+                  - "glue:CreateDatabase"
+                  - "glue:CreateTable"
+                Resource: "*"
+              # LakeFormation - data access and permissions
+              - Effect: Allow
+                Action:
+                  - "lakeformation:GetDataLakeSettings"
+                  - "lakeformation:GetDataAccess"
+                  - "lakeformation:GrantPermissions"
+                  - "lakeformation:RevokePermissions"
+                Resource: "*"
+              # S3 Tables - metadata table access
+              - Effect: Allow
+                Action:
+                  - "s3tables:GetTableBucket"
+                  - "s3tables:GetNamespace"
+                  - "s3tables:GetTable"
+                  - "s3tables:GetTableData"
+                  - "s3tables:GetTableMetadataLocation"
+                  - "s3tables:GetTableEncryption"
+                  - "s3tables:ListNamespaces"
+                  - "s3tables:ListTables"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/aws-s3"
+                  - !Sub "arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/aws-s3/table/*"
+              # STS - get account ID for S3 Batch Operations and assume
+              # orchestrator's LF admin role for LF grants in child stacks.
+              - Effect: Allow
+                Action:
+                  - "sts:GetCallerIdentity"
+                  - "sts:AssumeRole"
+                Resource: "*"
+              # KMS - describe and update key policies when customer-managed keys are used
+              - Effect: Allow
+                Action:
+                  - "kms:DescribeKey"
+                  - "kms:GetKeyPolicy"
+                  - "kms:PutKeyPolicy"
+                Resource: "*"
+              # Lambda - S3 Batch Operations invokes rollback functions
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:s3-rollback-*"
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:*"
+              # Distributed Map support — the state machine launches STANDARD child
+              # executions of itself (one per CSV row) so each gets its own 25k
+              # history-event budget. DescribeExecution/StopExecution are used by
+              # the parent to monitor and cancel children.
+              - Effect: Allow
+                Action:
+                  - "states:StartExecution"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-orchestrator"
+                  - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-cleanup"
+              - Effect: Allow
+                Action:
+                  - "states:DescribeExecution"
+                  - "states:StopExecution"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:execution:${AWS::StackName}-orchestrator/*"
+                  - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:execution:${AWS::StackName}-cleanup/*"
+              - Effect: Allow
+                Action:
+                  - "states:ListExecutions"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-orchestrator"
+                  - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-cleanup"
+              # Distributed Map ResultWriter — writes per-child result files and a
+              # manifest under intermediate/<execution-name>/ so the parent payload
+              # stays tiny regardless of row count.
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                  - "s3:AbortMultipartUpload"
+                  - "s3:ListMultipartUploadParts"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${ResultsBucket}/intermediate/*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogDelivery"
+                  - "logs:GetLogDelivery"
+                  - "logs:UpdateLogDelivery"
+                  - "logs:DeleteLogDelivery"
+                  - "logs:ListLogDeliveries"
+                  - "logs:PutResourcePolicy"
+                  - "logs:DescribeResourcePolicies"
+                  - "logs:DescribeLogGroups"
+                Resource: "*"
+              # SNS - publish failure notifications from state machines
+              - Effect: Allow
+                Action:
+                  - "sns:Publish"
+                Resource: "*"
+
+  OrchestratorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/stepfunctions/${AWS::StackName}-orchestrator
+      RetentionInDays: 30
+
+  CleanupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/stepfunctions/${AWS::StackName}-cleanup
+      RetentionInDays: 30
+
+  # SNS Topic for failure notifications from both state machines.
+  FailureNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasSNSEmailList
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-failure-notifications"
+
+  # Custom resource to subscribe comma-separated email list to the SNS topic.
+  SNSSubscriptionFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasSNSEmailList
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-sns-subscriptions"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          sns = boto3.client('sns')
+
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              try:
+                  topic_arn = event['ResourceProperties']['TopicArn']
+                  email_list = event['ResourceProperties']['EmailList']
+                  emails = [e.strip() for e in email_list.split(',') if e.strip()]
+                  for email in emails:
+                      sns.subscribe(
+                          TopicArn=topic_arn,
+                          Protocol='email',
+                          Endpoint=email
+                      )
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'SubscriptionCount': str(len(emails))
+                  })
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=str(e))
+
+  SNSSubscriptions:
+    Type: Custom::SNSSubscriptions
+    Condition: HasSNSEmailList
+    Properties:
+      ServiceToken: !GetAtt SNSSubscriptionFunction.Arn
+      TopicArn: !Ref FailureNotificationTopic
+      EmailList: !Ref SNSEmailList
+
+  # Elevate LambdaExecutionRole to LF data lake admin so CFN can create Glue
+  # databases in child stacks when the account is in Lake Formation mode.
+  # MutationType: APPEND preserves any existing admins.
+  OrchestratorLFAdmin:
+    Type: AWS::LakeFormation::DataLakeSettings
+    Properties:
+      Admins:
+        - DataLakePrincipalIdentifier: !GetAtt LambdaExecutionRole.Arn
+      MutationType: "APPEND"
+
+  # Fixed pool of 10 Athena WorkGroups shared across all child stacks.
+  # Each child stack is assigned one WorkGroup (by index % 10) so the
+  # total WorkGroup count stays at 10 regardless of how many rows are
+  # processed. This avoids the per-account 1,000 WorkGroup quota.
+  # EnforceWorkGroupConfiguration is false so each query specifies its
+  # own result location — WorkGroups are effectively stateless.
+  AthenaWorkGroup0:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-wg-0"
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: false
+  AthenaWorkGroup1:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-wg-1"
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: false
+  AthenaWorkGroup2:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-wg-2"
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: false
+  AthenaWorkGroup3:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-wg-3"
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: false
+  AthenaWorkGroup4:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-wg-4"
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: false
+  AthenaWorkGroup5:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-wg-5"
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: false
+  AthenaWorkGroup6:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-wg-6"
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: false
+  AthenaWorkGroup7:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-wg-7"
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: false
+  AthenaWorkGroup8:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-wg-8"
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: false
+  AthenaWorkGroup9:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-wg-9"
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: false
+
+  CsvParserFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-csv-parser"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          # Stagger settings (hardcoded, not CFN parameters — avoids cluttering
+          # the console). The parser assigns each row a StaggerSeconds value
+          # based on its position (index % MAX_CONCURRENCY), so that when the
+          # Distributed Map launches rows in waves of up to MAX_CONCURRENCY, the
+          # first STAGGER_BATCH_SIZE rows start immediately, the next batch
+          # after STAGGER_INTERVAL_SECONDS, and so on. This spreads CreateStack
+          # calls over time to avoid thundering-herd pressure on LF / KMS /
+          # Athena during the early phase of each child stack.
+          MAX_CONCURRENCY: "50"
+          STAGGER_BATCH_SIZE: "5"
+          STAGGER_INTERVAL_SECONDS: "15"
+          # WorkGroup pool — must match the 10 AthenaWorkGroup* resources above.
+          # Each row is assigned wg-<index % WORKGROUP_POOL_SIZE>.
+          WORKGROUP_POOL_SIZE: "10"
+          WORKGROUP_NAME_PREFIX: !Sub "${AWS::StackName}-wg-"
+      Code:
+        ZipFile: |
+          import boto3
+          import csv
+          import io
+          import os
+          import re
+
+          s3 = boto3.client('s3')
+
+          BUCKET_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]$')
+
+          # Stagger knobs — env-driven so they can be tuned without editing the
+          # state machine definition. See the environment block above for intent.
+          MAX_CONCURRENCY = int(os.environ.get('MAX_CONCURRENCY', '10'))
+          STAGGER_BATCH_SIZE = int(os.environ.get('STAGGER_BATCH_SIZE', '2'))
+          STAGGER_INTERVAL_SECONDS = int(os.environ.get('STAGGER_INTERVAL_SECONDS', '30'))
+
+          # WorkGroup pool — each row is assigned a WorkGroup by index so the
+          # total number of WorkGroups stays fixed regardless of row count.
+          WORKGROUP_POOL_SIZE = int(os.environ.get('WORKGROUP_POOL_SIZE', '10'))
+          WORKGROUP_NAME_PREFIX = os.environ.get('WORKGROUP_NAME_PREFIX', '')
+
+          def compute_stagger_seconds(row_index):
+              """
+              Stagger each row's start so no more than STAGGER_BATCH_SIZE rows
+              enter CreateStack in the same wave. Modulo MAX_CONCURRENCY keeps
+              the max wait bounded (doesn't scale with total row count) — this
+              matters because Distributed Map launches replacement executions
+              as in-flight children complete, and we want those replacements
+              spread too.
+
+              Example with MAX_CONCURRENCY=50, STAGGER_BATCH_SIZE=5, INTERVAL=15:
+                rows  0–4 -> 0s    5–9 -> 15s   10–14 -> 30s  ...  45–49 -> 135s
+                rows 50–54-> 0s   ... (repeats every 50 rows)
+              """
+              if STAGGER_BATCH_SIZE <= 0 or STAGGER_INTERVAL_SECONDS <= 0:
+                  return 0
+              return ((row_index % MAX_CONCURRENCY) // STAGGER_BATCH_SIZE) * STAGGER_INTERVAL_SECONDS
+
+          def compute_workgroup_name(row_index):
+              """
+              Assign a WorkGroup from the fixed pool by index so the total
+              WorkGroup count stays at WORKGROUP_POOL_SIZE regardless of how
+              many rows are processed.
+              """
+              if not WORKGROUP_NAME_PREFIX:
+                  return ''
+              return f'{WORKGROUP_NAME_PREFIX}{row_index % WORKGROUP_POOL_SIZE}'
+
+          def parse_s3_url(url):
+              url = url.strip()
+              if url.startswith('s3://'):
+                  path = url[5:]
+                  parts = path.split('/', 1)
+                  if len(parts) != 2 or not parts[1]:
+                      raise ValueError(f"Invalid S3 URL (missing key): {url}")
+                  return parts[0], parts[1]
+              elif url.startswith('https://'):
+                  from urllib.parse import urlparse
+                  parsed = urlparse(url)
+                  host = parsed.hostname or ''
+                  path = parsed.path.lstrip('/')
+                  if '.s3.' in host or host.endswith('.s3.amazonaws.com'):
+                      bucket = host.split('.s3.')[0] if '.s3.' in host else host.split('.s3.amazonaws.com')[0]
+                      return bucket, path
+                  elif host.startswith('s3.') or host.startswith('s3-'):
+                      parts = path.split('/', 1)
+                      if len(parts) != 2:
+                          raise ValueError(f"Invalid S3 HTTPS URL (missing key): {url}")
+                      return parts[0], parts[1]
+                  else:
+                      raise ValueError(f"Unrecognized S3 HTTPS URL format: {url}")
+              else:
+                  raise ValueError(f"Invalid S3 URL: {url}")
+
+          def handler(event, context):
+              s3_url = event['S3CsvUrl']
+              bucket, key = parse_s3_url(s3_url)
+
+              response = s3.get_object(Bucket=bucket, Key=key)
+              body = response['Body'].read().decode('utf-8')
+
+              reader = csv.reader(io.StringIO(body))
+              rows = list(reader)
+
+              if not rows:
+                  return []
+
+              first_val = rows[0][0].strip() if rows[0] else ''
+              if first_val and not BUCKET_NAME_RE.match(first_val):
+                  data_rows = rows[1:]
+                  row_offset = 2
+              else:
+                  data_rows = rows
+                  row_offset = 1
+
+              results = []
+              seen_buckets = set()
+              # Output index (monotonically increasing across valid rows) drives
+              # the stagger offset. Skipped rows don't consume a slot because
+              # their child execution just passes through with no CreateStack.
+              valid_index = 0
+
+              for i, row in enumerate(data_rows):
+                  row_num = i + row_offset
+                  bucket_name = row[0].strip() if row else ''
+
+                  if not bucket_name:
+                      results.append({
+                          'BucketName': '',
+                          'Prefix': '',
+                          'KmsKey': row[2].strip() if len(row) > 2 else '',
+                          'Status': 'SKIPPED',
+                          'Error': f'Row {row_num}: Missing required Bucket Name',
+                          'StaggerSeconds': 0
+                      })
+                      continue
+
+                  raw_prefix = row[1].strip() if len(row) > 1 else ''
+                  kms_key = row[2].strip() if len(row) > 2 else ''
+
+                  if not BUCKET_NAME_RE.match(bucket_name):
+                      results.append({
+                          'BucketName': bucket_name,
+                          'Prefix': raw_prefix,
+                          'KmsKey': kms_key,
+                          'Status': 'SKIPPED',
+                          'Error': f'Row {row_num}: Invalid bucket name format: {bucket_name}',
+                          'StaggerSeconds': 0
+                      })
+                      continue
+
+                  # Support comma-separated prefixes: split into individual entries
+                  # so each prefix gets its own child stack. A single prefix (or empty)
+                  # produces a one-element list, preserving existing behavior.
+                  prefixes = [p.strip() for p in raw_prefix.split(',') if p.strip()] if raw_prefix else ['']
+
+                  for prefix in prefixes:
+                      dedup_key = f'{bucket_name}/{prefix}'
+                      if dedup_key in seen_buckets:
+                          results.append({
+                              'BucketName': bucket_name,
+                              'Prefix': prefix,
+                              'KmsKey': kms_key,
+                              'Status': 'SKIPPED',
+                              'Error': f'Row {row_num}: Duplicate bucket/prefix: {dedup_key} (first seen earlier)',
+                              'StaggerSeconds': 0
+                          })
+                          continue
+
+                      seen_buckets.add(dedup_key)
+                      results.append({
+                          'BucketName': bucket_name,
+                          'Prefix': prefix,
+                          'KmsKey': kms_key,
+                          'StaggerSeconds': compute_stagger_seconds(valid_index),
+                          'WorkGroupName': compute_workgroup_name(valid_index)
+                      })
+                      valid_index += 1
+
+              return results
+
+  StackManagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-stack-manager"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 256
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !Ref ResultsBucket
+          START_S3_BATCH_OPS_JOBS: !Ref StartS3BatchOperationsJobs
+          TEMPLATE_URL: !Ref TemplateS3Url
+          SHARED_IAM_ROLE_ARN: !If [HasExistingSharedRole, !Ref SharedIAMRoleArn, !If [ShouldCreateSharedRole, !GetAtt ChildStackExecutionRole.Arn, ""]]
+          TIMESTAMP: !Ref TimeStamp
+          MODE: !Ref Mode
+          ORCHESTRATOR_STACK_ID: !Ref AWS::StackId
+          LF_ADMIN_ROLE_ARN: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import time
+          from botocore.exceptions import ClientError
+
+          cfn = boto3.client('cloudformation')
+          s3 = boto3.client('s3')
+
+          RESULTS_BUCKET = os.environ['RESULTS_BUCKET']
+          START_S3_BATCH_OPS_JOBS = os.environ['START_S3_BATCH_OPS_JOBS']
+          TEMPLATE_URL = os.environ['TEMPLATE_URL']
+          SHARED_IAM_ROLE_ARN = os.environ.get('SHARED_IAM_ROLE_ARN', '')
+          TIMESTAMP = os.environ['TIMESTAMP']
+          MODE = os.environ['MODE']
+          ORCHESTRATOR_STACK_ID = os.environ['ORCHESTRATOR_STACK_ID']
+          LF_ADMIN_ROLE_ARN = os.environ['LF_ADMIN_ROLE_ARN']
+
+          # Tag applied to every child stack this orchestrator creates. Used by
+          # find_existing_stack to scope dedup to stacks owned by *this* orchestrator
+          # deployment — so a leftover stack from a prior run, or a stack from a
+          # parallel orchestrator deployment, is never treated as a duplicate.
+          ORCHESTRATOR_TAG_KEY = 'S3RollbackOrchestratorStackId'
+
+          THROTTLE_CODES = ('Throttling', 'RequestThrottled', 'TooManyRequestsException')
+
+          def cfn_call(func, **kwargs):
+              """Call a CFN API with exponential backoff on throttling (up to 8 attempts).
+
+              Raises the original ClientError if every attempt is throttled, so callers
+              never receive None.
+              """
+              last_exc = None
+              for attempt in range(8):
+                  try:
+                      return func(**kwargs)
+                  except ClientError as e:
+                      code = e.response['Error'].get('Code', '')
+                      if code not in THROTTLE_CODES:
+                          raise
+                      last_exc = e
+                      if attempt < 7:
+                          delay = min(2 ** attempt + attempt, 60)
+                          print(f"Throttled ({code}), retry {attempt+1} in {delay}s")
+                          time.sleep(delay)
+              raise last_exc
+
+          def generate_stack_name(bucket_name, prefix=''):
+              suffix = os.urandom(3).hex()
+              safe_bucket = bucket_name.replace('.', '-')
+              if prefix:
+                  # Sanitise prefix: replace non-alphanumeric runs with '-', strip trailing '-'
+                  import re
+                  safe_prefix = re.sub(r'[^a-zA-Z0-9]+', '-', prefix).strip('-')
+              else:
+                  safe_prefix = ''
+              # Budget: 's3-rollback-' (12) + '-' (1) + '-' (1) + suffix (6) = 20 fixed chars
+              # Remaining 108 chars split between bucket and prefix slug
+              if safe_prefix:
+                  # Reserve up to 40 chars for the prefix slug; bucket gets the rest
+                  prefix_part = safe_prefix[:40].rstrip('-')
+                  bucket_part = safe_bucket[:67]
+                  return f's3-rollback-{bucket_part}-{prefix_part}-{suffix}'
+              else:
+                  bucket_part = safe_bucket[:108]
+                  return f's3-rollback-{bucket_part}-{suffix}'
+
+          def check_bucket_exists(bucket_name):
+              try:
+                  s3.head_bucket(Bucket=bucket_name)
+                  return True
+              except ClientError as e:
+                  code = int(e.response['ResponseMetadata']['HTTPStatusCode'])
+                  if code == 404:
+                      return False
+                  return True
+              except Exception:
+                  return True
+
+          def find_existing_stack(bucket_name, prefix=''):
+              """
+              Return an active child stack for this bucket/prefix that was created
+              by THIS orchestrator deployment, or None.
+
+              Matching dimensions:
+                - bucket name (via stack name prefix)
+                - Prefix parameter
+                - S3RollbackOrchestratorStackId tag equals this orchestrator's stack ID
+
+              The tag match is what scopes dedup to the current orchestrator run.
+              Without it, a leftover child stack from a previous run or a stack
+              created by a parallel orchestrator deployment would be treated as a
+              duplicate and the Lambda would return EXISTING — producing a silent
+              no-op while reporting SUCCEEDED.
+              """
+              safe_bucket = bucket_name.replace('.', '-')
+              name_prefix = f's3-rollback-{safe_bucket}-'
+              active_statuses = [
+                  'CREATE_IN_PROGRESS', 'CREATE_COMPLETE',
+                  'UPDATE_IN_PROGRESS', 'UPDATE_COMPLETE',
+                  'REVIEW_IN_PROGRESS'
+              ]
+              try:
+                  paginator = cfn.get_paginator('list_stacks')
+                  candidates = []
+                  for page in paginator.paginate(StackStatusFilter=active_statuses):
+                      for summary in page.get('StackSummaries', []):
+                          name = summary.get('StackName', '')
+                          if name.startswith(name_prefix):
+                              candidates.append({'StackName': name, 'Status': summary.get('StackStatus', '')})
+                  # For each candidate, check Prefix parameter AND owner tag match
+                  for candidate in candidates:
+                      try:
+                          resp = cfn.describe_stacks(StackName=candidate['StackName'])
+                          stacks = resp.get('Stacks', [])
+                          if not stacks:
+                              continue
+                          params = {p['ParameterKey']: p.get('ParameterValue', '')
+                                    for p in stacks[0].get('Parameters', [])}
+                          tags = {t['Key']: t['Value']
+                                  for t in stacks[0].get('Tags', [])}
+                          stack_prefix = params.get('Prefix', '')
+                          stack_owner = tags.get(ORCHESTRATOR_TAG_KEY, '')
+                          if stack_prefix == prefix and stack_owner == ORCHESTRATOR_STACK_ID:
+                              return candidate
+                      except Exception:
+                          continue
+              except Exception:
+                  pass
+              return None
+
+          def create_stack(row):
+              existing = find_existing_stack(row['BucketName'], row.get('Prefix', ''))
+              if existing:
+                  print(f"EXISTING bucket={row['BucketName']} prefix={row.get('Prefix','')} stack={existing['StackName']} status={existing['Status']}")
+                  return {
+                      'StackName': existing['StackName'],
+                      'Status': 'EXISTING',
+                      'Error': '',
+                      'BucketName': row['BucketName'],
+                      'Prefix': row.get('Prefix', ''),
+                      'TimeStamp': TIMESTAMP,
+                      'KmsKey': row.get('KmsKey', '')
+                  }
+
+              if not check_bucket_exists(row['BucketName']):
+                  print(f"SKIPPED bucket={row['BucketName']} reason=bucket_not_found")
+                  return {
+                      'StackName': '',
+                      'Status': 'SKIPPED',
+                      'Error': f"Bucket does not exist: {row['BucketName']}",
+                      'BucketName': row['BucketName'],
+                      'Prefix': row.get('Prefix', ''),
+                      'TimeStamp': TIMESTAMP,
+                      'KmsKey': row.get('KmsKey', '')
+                  }
+
+              stack_name = generate_stack_name(row['BucketName'], row.get('Prefix', ''))
+
+              params = [
+                  {'ParameterKey': 'BucketName', 'ParameterValue': row['BucketName']},
+                  {'ParameterKey': 'TimeStamp', 'ParameterValue': TIMESTAMP},
+                  {'ParameterKey': 'ExecutionMode', 'ParameterValue': MODE},
+                  {'ParameterKey': 'StartS3BatchOperationsJobs', 'ParameterValue': START_S3_BATCH_OPS_JOBS},
+              ]
+
+              prefix = row.get('Prefix', '')
+              if prefix:
+                  params.append({'ParameterKey': 'Prefix', 'ParameterValue': prefix})
+
+              kms_key = row.get('KmsKey', '')
+              if kms_key:
+                  params.append({'ParameterKey': 'ExistingKmsKeyIdOrArn', 'ParameterValue': kms_key})
+
+              if SHARED_IAM_ROLE_ARN:
+                  params.append({'ParameterKey': 'SharedIAMRoleArn', 'ParameterValue': SHARED_IAM_ROLE_ARN})
+
+              # Always pass the orchestrator's LambdaExecutionRole as the LF admin role
+              # so child stacks can make LF grants (via STS AssumeRole) without elevating
+              # per-stack roles to LF admin. This avoids the ConcurrentModificationException
+              # race and keeps the LF admin list clean regardless of how many buckets are
+              # being rolled back. Works with both shared and per-stack IAM roles.
+              params.append({'ParameterKey': 'LFAdminRoleArn', 'ParameterValue': LF_ADMIN_ROLE_ARN})
+
+              workgroup_name = row.get('WorkGroupName', '')
+              if workgroup_name:
+                  params.append({'ParameterKey': 'SharedAthenaWorkGroupName', 'ParameterValue': workgroup_name})
+
+              try:
+                  cfn_call(cfn.create_stack,
+                      StackName=stack_name,
+                      TemplateURL=TEMPLATE_URL,
+                      Parameters=params,
+                      Capabilities=['CAPABILITY_IAM', 'CAPABILITY_NAMED_IAM'],
+                      Tags=[
+                          {'Key': ORCHESTRATOR_TAG_KEY, 'Value': ORCHESTRATOR_STACK_ID}
+                      ]
+                  )
+                  print(f"CREATED bucket={row['BucketName']} stack={stack_name}")
+                  return {
+                      'StackName': stack_name,
+                      'Status': 'CREATE_IN_PROGRESS',
+                      'Error': '',
+                      'BucketName': row['BucketName'],
+                      'Prefix': row.get('Prefix', ''),
+                      'TimeStamp': TIMESTAMP,
+                      'KmsKey': kms_key
+                  }
+              except Exception as e:
+                  print(f"CREATE_FAILED bucket={row['BucketName']} stack={stack_name} error={e}")
+                  return {
+                      'StackName': stack_name,
+                      'Status': 'CREATE_FAILED',
+                      'Error': str(e),
+                      'BucketName': row['BucketName'],
+                      'Prefix': row.get('Prefix', ''),
+                      'TimeStamp': TIMESTAMP,
+                      'KmsKey': kms_key
+                  }
+
+          def poll_stack(stack_info):
+              stack_name = stack_info['StackName']
+              bucket_name = stack_info.get('BucketName', stack_name)
+              try:
+                  resp = cfn_call(cfn.describe_stacks, StackName=stack_name)
+                  stacks = resp.get('Stacks', [])
+                  if not stacks:
+                      stack_info['Status'] = 'NOT_FOUND'
+                      stack_info['Error'] = f'Stack {stack_name} not found'
+                      print(f"NOT_FOUND bucket={bucket_name} stack={stack_name}")
+                      return stack_info
+
+                  status = stacks[0]['StackStatus']
+                  stack_info['Status'] = status
+
+                  if status in ('CREATE_FAILED', 'ROLLBACK_COMPLETE', 'ROLLBACK_FAILED'):
+                      reason = stacks[0].get('StackStatusReason', '')
+                      stack_info['Error'] = reason
+                      print(f"FAILED bucket={bucket_name} stack={stack_name} status={status} reason={reason}")
+                  else:
+                      stack_info['Error'] = ''
+                      print(f"POLL bucket={bucket_name} stack={stack_name} status={status}")
+
+                  return stack_info
+              except Exception as e:
+                  stack_info['Status'] = 'POLL_ERROR'
+                  stack_info['Error'] = str(e)
+                  print(f"POLL_ERROR bucket={bucket_name} stack={stack_name} error={e}")
+                  return stack_info
+
+          def delete_stack(stack_name):
+              try:
+                  cfn_call(cfn.delete_stack, StackName=stack_name)
+                  return {'StackName': stack_name, 'Status': 'DELETE_IN_PROGRESS', 'Error': ''}
+              except Exception as e:
+                  return {'StackName': stack_name, 'Status': 'DELETE_FAILED', 'Error': str(e)}
+
+          def handler(event, context):
+              mode = event.get('Mode', 'create')
+
+              if mode == 'create':
+                  return create_stack(event.get('Row', {}))
+              elif mode == 'poll':
+                  return poll_stack(event.get('StackInfo', {}))
+              elif mode == 'delete':
+                  return delete_stack(event.get('StackInfo', {}).get('StackName', ''))
+              else:
+                  raise ValueError(f'Unknown mode: {mode}')
+
+  ResultsWriterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-results-writer"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 512
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          RESULTS_BUCKET: !Ref ResultsBucket
+      Code:
+        ZipFile: |
+          import boto3
+          import csv
+          import io
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          s3 = boto3.client('s3')
+
+          RESULTS_BUCKET = os.environ['RESULTS_BUCKET']
+
+          # CSV schema — keep in sync with the columns the test script and the
+          # s3-rollback-orchestrator user-facing docs expect.
+          CSV_HEADER = ['Bucket Name', 'Prefix', 'TimeStamp', 'KMS Key',
+                        'Stack Name', 'Stack Status', 'Error']
+
+          def _row_for(result):
+              return [
+                  result.get('BucketName', ''),
+                  result.get('Prefix', ''),
+                  result.get('TimeStamp', ''),
+                  result.get('KmsKey', ''),
+                  result.get('StackName', ''),
+                  result.get('Status', ''),
+                  result.get('Error', ''),
+              ]
+
+          def _read_json(bucket, key):
+              """Read a JSON file from S3 and return the decoded object."""
+              obj = s3.get_object(Bucket=bucket, Key=key)
+              return json.loads(obj['Body'].read())
+
+          def _collect_from_manifest(map_results):
+              """
+              Read the Distributed Map manifest + per-child result files and
+              return a flat list of child outputs.
+
+              The Distributed Map ResultWriter writes:
+                <prefix>/manifest.json — index with keys 'ResultFiles':
+                    { 'SUCCEEDED': [...], 'FAILED': [...], 'PENDING': [...] }
+                  each entry is {'Key': '...', 'Size': N}
+                <prefix>/SUCCEEDED_<n>.json, FAILED_<n>.json — each a JSON array
+                  of objects with shape:
+                    { "ExecutionArn": "...", "Input": {...}, "Output": "...", ... }
+                  where Output is a JSON-encoded string of the child's final state.
+
+              We collect every item we can: succeeded child outputs are the CSV
+              rows; failed child outputs carry the error in Output or Cause ?
+              we synthesise a best-effort row so nothing is silently lost.
+              """
+              writer_details = map_results.get('ResultWriterDetails', {})
+              bucket = writer_details.get('Bucket')
+              manifest_key = writer_details.get('Key')
+              if not bucket or not manifest_key:
+                  print(f"WARNING: No ResultWriterDetails in MapResults: {map_results}")
+                  return []
+
+              manifest = _read_json(bucket, manifest_key)
+              print(f"Manifest: ProcessedItemCount={manifest.get('ProcessedItemCount')} "
+                    f"FailedItemsCount={manifest.get('FailedItemsCount')}")
+
+              result_files = manifest.get('ResultFiles', {})
+              collected = []
+
+              for status_bucket in ('SUCCEEDED', 'FAILED', 'PENDING'):
+                  for entry in result_files.get(status_bucket, []):
+                      file_key = entry.get('Key')
+                      if not file_key:
+                          continue
+                      try:
+                          items = _read_json(bucket, file_key)
+                      except Exception as exc:
+                          print(f"WARNING: Could not read {file_key}: {exc}")
+                          continue
+                      for item in items:
+                          try:
+                              output_str = item.get('Output', '')
+                              if output_str:
+                                  parsed = json.loads(output_str)
+                              else:
+                                  parsed = {}
+                          except Exception:
+                              parsed = {}
+
+                          if status_bucket == 'SUCCEEDED' and parsed:
+                              collected.append(parsed)
+                          else:
+                              # For FAILED/PENDING: synthesise a row from Input
+                              # + any Cause/Error fields so the CSV reflects the
+                              # failure rather than dropping the row.
+                              item_input = item.get('Input', {}) or {}
+                              if isinstance(item_input, str):
+                                  try:
+                                      item_input = json.loads(item_input)
+                                  except Exception:
+                                      item_input = {}
+                              row = item_input.get('Row', {}) if isinstance(item_input, dict) else {}
+                              cause = item.get('Cause') or item.get('Error') or ''
+                              collected.append({
+                                  'BucketName': row.get('BucketName', ''),
+                                  'Prefix': row.get('Prefix', ''),
+                                  'TimeStamp': item_input.get('TimeStamp', '') if isinstance(item_input, dict) else '',
+                                  'KmsKey': row.get('KmsKey', ''),
+                                  'StackName': '',
+                                  'Status': status_bucket,
+                                  'Error': cause or f'Child execution finished in state {status_bucket}',
+                              })
+
+              return collected
+
+          def handler(event, context):
+              # Two invocation shapes are supported:
+              #   1. Distributed Map MapResults object (has 'ResultWriterDetails')
+              #      — load child outputs from S3.
+              #   2. Plain list of results, or {'Results': [...]}
+              #      — legacy shape, used by WritePartialResults after a Map failure.
+              if isinstance(event, dict) and 'ResultWriterDetails' in event:
+                  results = _collect_from_manifest(event)
+              elif isinstance(event, list):
+                  results = event
+              else:
+                  results = event.get('Results', []) if isinstance(event, dict) else []
+
+              print(f"Writing {len(results)} rows to results CSV.")
+
+              output = io.StringIO()
+              writer = csv.writer(output)
+              writer.writerow(CSV_HEADER)
+              for result in results:
+                  writer.writerow(_row_for(result))
+
+              timestamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S-%f')
+              key = f'results/orchestrator-results-{timestamp}.csv'
+
+              s3.put_object(
+                  Bucket=RESULTS_BUCKET,
+                  Key=key,
+                  Body=output.getvalue(),
+                  ContentType='text/csv'
+              )
+
+              return {'ResultsKey': key, 'RowCount': len(results)}
+
+  OrchestratorStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${AWS::StackName}-orchestrator"
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt OrchestratorLogGroup.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "S3 Rollback Orchestrator",
+          "StartAt": "ParseCSV",
+          "States": {
+            "ParseCSV": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${CsvParserFunction.Arn}",
+                "Payload": {
+                  "S3CsvUrl.$": "$.S3CsvUrl"
+                }
+              },
+              "ResultSelector": {
+                "Rows.$": "$.Payload"
+              },
+              "ResultPath": "$.ParseResult",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.ErrorInfo",
+                  "Next": "ExecutionFailed"
+                }
+              ],
+              "Next": "MapOverRows"
+            },
+            "MapOverRows": {
+              "Type": "Map",
+              "ItemsPath": "$.ParseResult.Rows",
+              "MaxConcurrency": 50,
+              "ItemProcessor": {
+                "ProcessorConfig": {
+                  "Mode": "DISTRIBUTED",
+                  "ExecutionType": "STANDARD"
+                },
+                "StartAt": "StaggerWait",
+                "States": {
+                  "StaggerWait": {
+                    "Type": "Wait",
+                    "SecondsPath": "$.Row.StaggerSeconds",
+                    "Next": "CheckIfSkipped"
+                  },
+                  "CheckIfSkipped": {
+                    "Type": "Choice",
+                    "Choices": [
+                      {
+                        "And": [
+                          {
+                            "Variable": "$.Row.Status",
+                            "IsPresent": true
+                          },
+                          {
+                            "Variable": "$.Row.Status",
+                            "StringEquals": "SKIPPED"
+                          }
+                        ],
+                        "Next": "PassSkippedRow"
+                      }
+                    ],
+                    "Default": "CreateStack"
+                  },
+                  "PassSkippedRow": {
+                    "Type": "Pass",
+                    "Parameters": {
+                      "BucketName.$": "$.Row.BucketName",
+                      "Prefix.$": "$.Row.Prefix",
+                      "KmsKey.$": "$.Row.KmsKey",
+                      "TimeStamp.$": "$.TimeStamp",
+                      "Status.$": "$.Row.Status",
+                      "Error.$": "$.Row.Error"
+                    },
+                    "End": true
+                  },
+                  "CreateStack": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": {
+                      "FunctionName": "${StackManagerFunction.Arn}",
+                      "Payload": {
+                        "Mode": "create",
+                        "Row.$": "$.Row",
+                        "TimeStamp.$": "$.TimeStamp",
+                        "ExecutionMode.$": "$.Mode"
+                      }
+                    },
+                    "ResultSelector": {
+                      "StackInfo.$": "$.Payload"
+                    },
+                    "ResultPath": "$.CreateResult",
+                    "Retry": [
+                      {
+                        "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                        "IntervalSeconds": 5,
+                        "MaxAttempts": 3,
+                        "BackoffRate": 2.0
+                      }
+                    ],
+                    "Catch": [
+                      {
+                        "ErrorEquals": ["States.ALL"],
+                        "ResultPath": "$.ErrorInfo",
+                        "Next": "CollectErrorResult"
+                      }
+                    ],
+                    "Next": "CheckCreateResult"
+                  },
+                  "CheckCreateResult": {
+                    "Type": "Choice",
+                    "Choices": [
+                      {
+                        "Variable": "$.CreateResult.StackInfo.Status",
+                        "StringEquals": "CREATE_IN_PROGRESS",
+                        "Next": "InitPollCount"
+                      }
+                    ],
+                    "Default": "CollectCreateResult"
+                  },
+                  "CollectCreateResult": {
+                    "Type": "Pass",
+                    "InputPath": "$.CreateResult.StackInfo",
+                    "End": true
+                  },
+                  "CollectErrorResult": {
+                    "Type": "Fail",
+                    "Error": "CREATE_FAILED",
+                    "CausePath": "$.ErrorInfo.Cause"
+                  },
+                  "InitPollCount": {
+                    "Type": "Pass",
+                    "Parameters": {
+                      "StackInfo.$": "$.CreateResult.StackInfo",
+                      "PollCount": 0
+                    },
+                    "Next": "WaitForStack"
+                  },
+                  "WaitForStack": {
+                    "Type": "Wait",
+                    "Seconds": 30,
+                    "Next": "CheckStackStatus"
+                  },
+                  "CheckStackStatus": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": {
+                      "FunctionName": "${StackManagerFunction.Arn}",
+                      "Payload": {
+                        "Mode": "poll",
+                        "StackInfo.$": "$.StackInfo"
+                      }
+                    },
+                    "ResultSelector": {
+                      "StackInfo.$": "$.Payload"
+                    },
+                    "ResultPath": "$.PollResult",
+                    "Retry": [
+                      {
+                        "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                        "IntervalSeconds": 2,
+                        "MaxAttempts": 3,
+                        "BackoffRate": 2.0
+                      }
+                    ],
+                    "Catch": [
+                      {
+                        "ErrorEquals": ["States.ALL"],
+                        "ResultPath": "$.ErrorInfo",
+                        "Next": "CollectPollErrorResult"
+                      }
+                    ],
+                    "Next": "IncrementPollCount"
+                  },
+                  "CollectPollErrorResult": {
+                    "Type": "Fail",
+                    "Error": "POLL_ERROR",
+                    "CausePath": "$.ErrorInfo.Cause"
+                  },
+                  "IncrementPollCount": {
+                    "Type": "Pass",
+                    "Parameters": {
+                      "StackInfo.$": "$.PollResult.StackInfo",
+                      "PollCount.$": "States.MathAdd($.PollCount, 1)"
+                    },
+                    "Next": "EvaluateStackStatus"
+                  },
+                  "EvaluateStackStatus": {
+                    "Type": "Choice",
+                    "Choices": [
+                      {
+                        "And": [
+                          {
+                            "Variable": "$.StackInfo.Status",
+                            "StringMatches": "*IN_PROGRESS"
+                          },
+                          {
+                            "Variable": "$.PollCount",
+                            "NumericLessThan": 120
+                          }
+                        ],
+                        "Next": "WaitForStack"
+                      },
+                      {
+                        "Variable": "$.PollCount",
+                        "NumericGreaterThanEquals": 120,
+                        "Next": "DeleteTimedOutStack"
+                      },
+                      {
+                        "Variable": "$.StackInfo.Status",
+                        "StringEquals": "CREATE_COMPLETE",
+                        "Next": "CollectResult"
+                      },
+                      {
+                        "Variable": "$.StackInfo.Status",
+                        "StringEquals": "EXISTING",
+                        "Next": "CollectResult"
+                      }
+                    ],
+                    "Default": "FailResult"
+                  },
+                  "FailResult": {
+                    "Type": "Fail",
+                    "ErrorPath": "$.StackInfo.Status",
+                    "CausePath": "$.StackInfo.Error"
+                  },
+                  "DeleteTimedOutStack": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": {
+                      "FunctionName": "${StackManagerFunction.Arn}",
+                      "Payload": {
+                        "Mode": "delete",
+                        "StackInfo.$": "$.StackInfo"
+                      }
+                    },
+                    "ResultPath": "$.DeleteResult",
+                    "Catch": [
+                      {
+                        "ErrorEquals": ["States.ALL"],
+                        "ResultPath": "$.DeleteError",
+                        "Next": "MarkTimeout"
+                      }
+                    ],
+                    "Next": "MarkTimeout"
+                  },
+                  "MarkTimeout": {
+                    "Type": "Fail",
+                    "Error": "TIMEOUT",
+                    "Cause": "Polling exceeded 120 iterations (~60 minutes)"
+                  },
+                  "CollectResult": {
+                    "Type": "Pass",
+                    "Parameters": {
+                      "BucketName.$": "$.StackInfo.BucketName",
+                      "Prefix.$": "$.StackInfo.Prefix",
+                      "TimeStamp.$": "$.StackInfo.TimeStamp",
+                      "KmsKey.$": "$.StackInfo.KmsKey",
+                      "StackName.$": "$.StackInfo.StackName",
+                      "Status.$": "$.StackInfo.Status",
+                      "Error.$": "$.StackInfo.Error"
+                    },
+                    "End": true
+                  }
+                }
+              },
+              "ItemSelector": {
+                "Row.$": "$$.Map.Item.Value",
+                "TimeStamp.$": "$$.Execution.Input.TimeStamp",
+                "Mode.$": "$$.Execution.Input.Mode"
+              },
+              "ResultWriter": {
+                "Resource": "arn:aws:states:::s3:putObject",
+                "Parameters": {
+                  "Bucket": "${ResultsBucket}",
+                  "Prefix.$": "States.Format('intermediate/{}', $$.Execution.Name)"
+                }
+              },
+              "ResultPath": "$.MapResults",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.ErrorInfo",
+                  "Next": "WritePartialResults"
+                }
+              ],
+              "Next": "GenerateResults"
+            },
+            "GenerateResults": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ResultsWriterFunction.Arn}",
+                "Payload.$": "$.MapResults"
+              },
+              "ResultSelector": {
+                "ResultsKey.$": "$.Payload.ResultsKey"
+              },
+              "ResultPath": "$.GenerateResult",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.ErrorInfo",
+                  "Next": "ExecutionFailed"
+                }
+              ],
+              "End": true
+            },
+            "WritePartialResults": {
+              "Type": "Pass",
+              "Parameters": {
+                "Error.$": "$.ErrorInfo"
+              },
+              "ResultPath": "$.PartialError",
+              "Next": "CheckPartialResults"
+            },
+            "CheckPartialResults": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.MapResults",
+                  "IsPresent": true,
+                  "Next": "WriteAvailableResults"
+                }
+              ],
+              "Default": "ExecutionFailed"
+            },
+            "WriteAvailableResults": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ResultsWriterFunction.Arn}",
+                "Payload.$": "$.MapResults"
+              },
+              "ResultSelector": {
+                "ResultsKey.$": "$.Payload.ResultsKey"
+              },
+              "ResultPath": "$.PartialResultsOutput",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.WriteError",
+                  "Next": "ExecutionFailed"
+                }
+              ],
+              "Next": "ExecutionFailed"
+            },
+            "ExecutionFailed": {
+              "Type": "Fail",
+              "Error": "OrchestratorExecutionFailed",
+              "Cause": "The orchestrator encountered an unrecoverable error. Check CloudWatch Logs for details."
+            }
+          }
+        }
+
+  # ---------------------------------------------------------------------------
+  # Cleanup state machine — runs on orchestrator stack deletion to remove all
+  # child stacks. Uses a Distributed Map so each stack is deleted and polled
+  # independently with no Lambda timeout ceiling.
+  # ---------------------------------------------------------------------------
+
+  CleanupStopExecutionsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-cleanup-stop-executions"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 128
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+
+          sfn = boto3.client('stepfunctions')
+
+          def handler(event, context):
+              state_machine_arn = event.get('StateMachineArn', '')
+              stopped = []
+              if state_machine_arn:
+                  try:
+                      paginator = sfn.get_paginator('list_executions')
+                      for page in paginator.paginate(
+                              stateMachineArn=state_machine_arn,
+                              statusFilter='RUNNING'):
+                          for ex in page.get('executions', []):
+                              arn = ex['executionArn']
+                              try:
+                                  sfn.stop_execution(
+                                      executionArn=arn,
+                                      cause='Orchestrator stack deletion in progress')
+                                  stopped.append(arn)
+                                  print(f"Stopped: {arn}")
+                              except Exception as e:
+                                  print(f"Warning: could not stop {arn}: {e}")
+                  except Exception as e:
+                      print(f"Warning: list_executions failed: {e}")
+              return {'StoppedCount': len(stopped)}
+
+  CleanupFindStacksFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-cleanup-find-stacks"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 256
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import time
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+
+          cfn = boto3.client('cloudformation')
+          ORCHESTRATOR_TAG_KEY = 'S3RollbackOrchestratorStackId'
+
+          def handler(event, context):
+              orchestrator_stack_id = event['OrchestratorStackId']
+              search_statuses = [
+                  'CREATE_IN_PROGRESS', 'CREATE_COMPLETE', 'CREATE_FAILED',
+                  'UPDATE_IN_PROGRESS', 'UPDATE_COMPLETE', 'REVIEW_IN_PROGRESS',
+                  'ROLLBACK_IN_PROGRESS', 'ROLLBACK_COMPLETE', 'ROLLBACK_FAILED',
+                  'DELETE_FAILED',
+              ]
+              candidates = []
+              paginator = cfn.get_paginator('list_stacks')
+              for page in paginator.paginate(StackStatusFilter=search_statuses):
+                  for s in page.get('StackSummaries', []):
+                      name = s.get('StackName', '')
+                      if name.startswith('s3-rollback-'):
+                          candidates.append(name)
+              print(f"Checking tags on {len(candidates)} candidate stacks...")
+
+              def check_tag(stack_name):
+                  delay = 1.0
+                  for attempt in range(6):
+                      try:
+                          resp = cfn.describe_stacks(StackName=stack_name)
+                          stacks = resp.get('Stacks', [])
+                          if stacks:
+                              tags = {t['Key']: t['Value']
+                                      for t in stacks[0].get('Tags', [])}
+                              if tags.get(ORCHESTRATOR_TAG_KEY) == orchestrator_stack_id:
+                                  return stack_name
+                          return None
+                      except cfn.exceptions.ClientError as e:
+                          code = e.response['Error']['Code']
+                          if code in ('Throttling', 'RequestThrottled') and attempt < 5:
+                              time.sleep(delay + attempt * 0.5)
+                              delay = min(delay * 2, 30)
+                              continue
+                          return None
+                  return None
+
+              found = []
+              with ThreadPoolExecutor(max_workers=5) as pool:
+                  futures = {pool.submit(check_tag, n): n for n in candidates}
+                  done = 0
+                  for fut in as_completed(futures):
+                      result = fut.result()
+                      if result:
+                          found.append(result)
+                      done += 1
+                      if done % 200 == 0:
+                          print(f"  {done}/{len(candidates)} checked, {len(found)} found...")
+              print(f"Found {len(found)} child stacks")
+              return [{'StackName': name} for name in found]
+
+  CleanupDeleteOneFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-cleanup-delete-one"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 128
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import time
+          from botocore.exceptions import ClientError
+
+          cfn = boto3.client('cloudformation')
+          THROTTLE_CODES = ('Throttling', 'RequestThrottled', 'TooManyRequestsException')
+
+          def cfn_call(func, **kwargs):
+              # Retry on throttling up to 8 attempts; raise the original ClientError
+              # if every attempt is throttled so callers never receive None.
+              last_exc = None
+              for attempt in range(8):
+                  try:
+                      return func(**kwargs)
+                  except ClientError as e:
+                      code = e.response['Error'].get('Code', '')
+                      if code not in THROTTLE_CODES:
+                          raise
+                      last_exc = e
+                      if attempt < 7:
+                          delay = min(2 ** attempt + attempt, 60)
+                          print(f"Throttled ({code}), retry {attempt+1} in {delay}s")
+                          time.sleep(delay)
+              raise last_exc
+
+          def handler(event, context):
+              stack_name = event['StackName']
+              print(f"Deleting {stack_name}")
+              try:
+                  cfn_call(cfn.delete_stack, StackName=stack_name)
+              except ClientError as e:
+                  msg = str(e)
+                  if 'does not exist' not in msg and 'DELETE_IN_PROGRESS' not in msg:
+                      raise
+              return {'StackName': stack_name, 'Status': 'DELETE_IN_PROGRESS'}
+
+  CleanupPollOneFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-cleanup-poll-one"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 128
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import time
+          from botocore.exceptions import ClientError
+
+          cfn = boto3.client('cloudformation')
+          THROTTLE_CODES = ('Throttling', 'RequestThrottled', 'TooManyRequestsException')
+
+          def cfn_call(func, **kwargs):
+              # Retry on throttling up to 8 attempts; raise the original ClientError
+              # if every attempt is throttled so callers never receive None.
+              last_exc = None
+              for attempt in range(8):
+                  try:
+                      return func(**kwargs)
+                  except ClientError as e:
+                      code = e.response['Error'].get('Code', '')
+                      if code not in THROTTLE_CODES:
+                          raise
+                      last_exc = e
+                      if attempt < 7:
+                          delay = min(2 ** attempt + attempt, 60)
+                          print(f"Throttled ({code}), retry {attempt+1} in {delay}s")
+                          time.sleep(delay)
+              raise last_exc
+
+          def get_failed_resources(stack_name):
+              """List resources that failed to delete with their reasons."""
+              failed     = {}   # logical_id -> reason
+              completed  = set()
+              try:
+                  paginator = cfn.get_paginator('describe_stack_events')
+                  for page in paginator.paginate(StackName=stack_name):
+                      for event in page['StackEvents']:
+                          lid    = event.get('LogicalResourceId')
+                          status = event.get('ResourceStatus', '')
+                          if not lid or lid == stack_name:
+                              continue
+                          if status == 'DELETE_COMPLETE':
+                              completed.add(lid)
+                          elif status == 'DELETE_FAILED' and lid not in failed:
+                              failed[lid] = event.get('ResourceStatusReason', '')[:200]
+              except Exception as e:
+                  print(f"Warning: describe_stack_events failed for {stack_name}: {e}")
+              return [{'LogicalId': lid, 'Reason': reason}
+                      for lid, reason in failed.items()
+                      if lid not in completed]
+
+          def handler(event, context):
+              stack_name = event['StackName']
+              try:
+                  resp   = cfn_call(cfn.describe_stacks, StackName=stack_name)
+                  status = resp['Stacks'][0]['StackStatus']
+              except ClientError as e:
+                  status = 'DELETE_COMPLETE' if 'does not exist' in str(e) else 'ERROR'
+
+              print(f"{stack_name}: {status}")
+              result = {'StackName': stack_name, 'Status': status}
+              if status == 'DELETE_FAILED':
+                  result['FailedResources'] = get_failed_resources(stack_name)
+              return result
+
+  CleanupTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-cleanup-trigger"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 900
+      MemorySize: 128
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          import time
+
+          sfn = boto3.client('stepfunctions')
+
+          def handler(event, context):
+              if event['RequestType'] != 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              try:
+                  props = event['ResourceProperties']
+                  resp  = sfn.start_execution(
+                      stateMachineArn=props['CleanupStateMachineArn'],
+                      input=json.dumps({
+                          'OrchestratorStackId':         props['OrchestratorStackId'],
+                          'OrchestratorStateMachineArn': props['OrchestratorStateMachineArn'],
+                      })
+                  )
+                  execution_arn = resp['executionArn']
+                  print(f"Started cleanup execution: {execution_arn}")
+                  # Poll until done or Lambda deadline (leave 10s for cfnresponse)
+                  deadline = context.get_remaining_time_in_millis() / 1000 - 10
+                  start    = time.monotonic()
+                  while time.monotonic() - start < deadline:
+                      time.sleep(15)
+                      desc   = sfn.describe_execution(executionArn=execution_arn)
+                      status = desc['status']
+                      print(f"Cleanup status: {status}")
+                      if status == 'SUCCEEDED':
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                           {'ExecutionArn': execution_arn})
+                          return
+                      elif status in ('FAILED', 'TIMED_OUT', 'ABORTED'):
+                          # Surface the cleanup failure as a CFN custom resource
+                          # failure so orchestrator stack deletion fails loudly.
+                          # The shared IAM role is preserved (DependsOn) so the
+                          # operator can retry the stack delete after fixing
+                          # whatever caused the child stack to get stuck.
+                          reason = (f'Cleanup state machine {status}. '
+                                    f'See execution {execution_arn} for which '
+                                    f'child stack(s) failed and which resources '
+                                    f'are stuck.')
+                          print(f"FAILED: {reason}")
+                          cfnresponse.send(event, context, cfnresponse.FAILED, {},
+                                           reason=reason[:1024])
+                          return
+
+                  # Lambda about to time out — abort the execution and fail loudly.
+                  # We must not return SUCCESS while the cleanup is still running,
+                  # because CFN would then proceed to delete the shared role and
+                  # any in-flight child stack deletions would be left orphaned.
+                  reason = (f'Cleanup did not complete within Lambda timeout '
+                            f'(900s). Execution {execution_arn} aborted. '
+                            f'Re-delete the orchestrator stack to retry, or '
+                            f'check the state machine for stuck stacks.')
+                  try:
+                      sfn.stop_execution(executionArn=execution_arn,
+                                         cause='Trigger Lambda timeout')
+                  except Exception as e:
+                      print(f"Warning: could not stop execution: {e}")
+                  print(f"FAILED: {reason}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {},
+                                   reason=reason[:1024])
+              except Exception as e:
+                  print(f"Error: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=str(e))
+
+  CleanupStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${AWS::StackName}-cleanup"
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: false
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt CleanupLogGroup.Arn
+      Definition:
+        Comment: "Deletes all child stacks tagged with this orchestrator's stack ID"
+        StartAt: StopOrchestratorExecutions
+        States:
+          StopOrchestratorExecutions:
+            Type: Task
+            Resource: !GetAtt CleanupStopExecutionsFunction.Arn
+            Parameters:
+              StateMachineArn.$: "$.OrchestratorStateMachineArn"
+            ResultPath: "$.StopResult"
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                IntervalSeconds: 5
+                MaxAttempts: 4
+                BackoffRate: 2.0
+            Next: FindChildStacks
+
+          FindChildStacks:
+            Type: Task
+            Resource: !GetAtt CleanupFindStacksFunction.Arn
+            Parameters:
+              OrchestratorStackId.$: "$.OrchestratorStackId"
+            ResultPath: "$.ChildStacks"
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                  - Lambda.TooManyRequestsException
+                IntervalSeconds: 5
+                MaxAttempts: 4
+                BackoffRate: 2.0
+            Next: AnyStacksToDelete
+
+          AnyStacksToDelete:
+            Type: Choice
+            Choices:
+              - Variable: "$.ChildStacks[0]"
+                IsPresent: true
+                Next: DeleteAllStacks
+            Default: CleanupComplete
+
+          DeleteAllStacks:
+            Type: Map
+            ItemsPath: "$.ChildStacks"
+            MaxConcurrency: 50
+            ItemProcessor:
+              ProcessorConfig:
+                Mode: DISTRIBUTED
+                ExecutionType: STANDARD
+              StartAt: DeleteStack
+              States:
+                DeleteStack:
+                  Type: Task
+                  Resource: !GetAtt CleanupDeleteOneFunction.Arn
+                  Parameters:
+                    StackName.$: "$.StackName"
+                  ResultPath: "$"
+                  Retry:
+                    - ErrorEquals:
+                        - Lambda.ServiceException
+                        - Lambda.AWSLambdaException
+                        - Lambda.SdkClientException
+                        - Lambda.TooManyRequestsException
+                      IntervalSeconds: 5
+                      MaxAttempts: 6
+                      BackoffRate: 2.0
+                  Next: WaitForDelete
+
+                WaitForDelete:
+                  Type: Wait
+                  Seconds: 30
+                  Next: PollStack
+
+                PollStack:
+                  Type: Task
+                  Resource: !GetAtt CleanupPollOneFunction.Arn
+                  Parameters:
+                    StackName.$: "$.StackName"
+                  ResultPath: "$"
+                  Retry:
+                    - ErrorEquals:
+                        - Lambda.ServiceException
+                        - Lambda.AWSLambdaException
+                        - Lambda.SdkClientException
+                        - Lambda.TooManyRequestsException
+                      IntervalSeconds: 5
+                      MaxAttempts: 6
+                      BackoffRate: 2.0
+                  Next: CheckDeleteStatus
+
+                CheckDeleteStatus:
+                  Type: Choice
+                  Choices:
+                    - Variable: "$.Status"
+                      StringEquals: "DELETE_COMPLETE"
+                      Next: StackDeleted
+                    - Variable: "$.Status"
+                      StringEquals: "DELETE_FAILED"
+                      Next: RetryDelete
+                  Default: WaitForDelete
+
+                RetryDelete:
+                  Type: Task
+                  Resource: !GetAtt CleanupDeleteOneFunction.Arn
+                  Parameters:
+                    StackName.$: "$.StackName"
+                  ResultPath: "$"
+                  Retry:
+                    - ErrorEquals:
+                        - Lambda.ServiceException
+                        - Lambda.AWSLambdaException
+                        - Lambda.SdkClientException
+                        - Lambda.TooManyRequestsException
+                      IntervalSeconds: 10
+                      MaxAttempts: 6
+                      BackoffRate: 2.0
+                  Next: WaitAfterRetry
+
+                WaitAfterRetry:
+                  Type: Wait
+                  Seconds: 60
+                  Next: PollAfterRetry
+
+                PollAfterRetry:
+                  Type: Task
+                  Resource: !GetAtt CleanupPollOneFunction.Arn
+                  Parameters:
+                    StackName.$: "$.StackName"
+                  ResultPath: "$"
+                  Retry:
+                    - ErrorEquals:
+                        - Lambda.ServiceException
+                        - Lambda.AWSLambdaException
+                        - Lambda.SdkClientException
+                        - Lambda.TooManyRequestsException
+                      IntervalSeconds: 5
+                      MaxAttempts: 6
+                      BackoffRate: 2.0
+                  Next: CheckRetryStatus
+
+                CheckRetryStatus:
+                  Type: Choice
+                  Choices:
+                    - Variable: "$.Status"
+                      StringEquals: "DELETE_COMPLETE"
+                      Next: StackDeleted
+                    - Variable: "$.Status"
+                      StringEquals: "DELETE_FAILED"
+                      Next: StackFailed
+                  Default: WaitForDelete
+
+                StackDeleted:
+                  Type: Succeed
+
+                StackFailed:
+                  Type: Fail
+                  ErrorPath: "$.Status"
+                  CausePath: "States.JsonToString($.FailedResources)"
+
+            ResultPath: "$.DeleteResults"
+            Next: CleanupComplete
+
+          CleanupComplete:
+            Type: Succeed
+
+  # EventBridge rules to notify via SNS when either state machine fails.
+  OrchestratorFailureRule:
+    Type: AWS::Events::Rule
+    Condition: HasSNSEmailList
+    Properties:
+      Description: "Notify on orchestrator state machine execution failure"
+      EventPattern:
+        source:
+          - aws.states
+        detail-type:
+          - "Step Functions Execution Status Change"
+        detail:
+          status:
+            - FAILED
+            - TIMED_OUT
+            - ABORTED
+          stateMachineArn:
+            - !Ref OrchestratorStateMachine
+      Targets:
+        - Id: SNSTarget
+          Arn: !Ref FailureNotificationTopic
+          InputTransformer:
+            InputPathsMap:
+              executionArn: "$.detail.executionArn"
+              status: "$.detail.status"
+              startDate: "$.detail.startDate"
+              stopDate: "$.detail.stopDate"
+            InputTemplate: |
+              "S3 Rollback Orchestrator execution <status>. Execution: <executionArn>. Started: <startDate>. Stopped: <stopDate>. Check CloudWatch Logs for details."
+
+  CleanupFailureRule:
+    Type: AWS::Events::Rule
+    Condition: HasSNSEmailList
+    Properties:
+      Description: "Notify on cleanup state machine execution failure"
+      EventPattern:
+        source:
+          - aws.states
+        detail-type:
+          - "Step Functions Execution Status Change"
+        detail:
+          status:
+            - FAILED
+            - TIMED_OUT
+            - ABORTED
+          stateMachineArn:
+            - !Ref CleanupStateMachine
+      Targets:
+        - Id: SNSTarget
+          Arn: !Ref FailureNotificationTopic
+          InputTransformer:
+            InputPathsMap:
+              executionArn: "$.detail.executionArn"
+              status: "$.detail.status"
+              startDate: "$.detail.startDate"
+              stopDate: "$.detail.stopDate"
+            InputTemplate: |
+              "S3 Rollback Cleanup execution <status>. Execution: <executionArn>. Started: <startDate>. Stopped: <stopDate>. Check CloudWatch Logs for details."
+
+  # Allow EventBridge to publish to the SNS topic
+  FailureTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: HasSNSEmailList
+    Properties:
+      Topics:
+        - !Ref FailureNotificationTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: "sns:Publish"
+            Resource: !Ref FailureNotificationTopic
+
+  AutoStartFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-auto-start"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+
+          sfn = boto3.client('stepfunctions')
+
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              try:
+                  state_machine_arn = event['ResourceProperties']['StateMachineArn']
+                  execution_input = event['ResourceProperties']['ExecutionInput']
+
+                  resp = sfn.start_execution(
+                      stateMachineArn=state_machine_arn,
+                      input=json.dumps(execution_input)
+                  )
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'ExecutionArn': resp['executionArn']
+                  })
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=str(e))
+
+  ChildStackCleanupTrigger:
+    Type: Custom::ChildStackCleanup
+    Condition: ShouldCreateSharedRole
+    # DependsOn: ChildStackExecutionRole forces CFN to keep the shared role
+    # alive until the trigger completes. Combined with the trigger polling
+    # the cleanup state machine to completion, this guarantees the shared
+    # role is available for every child stack's custom resource Lambdas
+    # during cleanup. Without this, CFN could delete the shared role in
+    # parallel with the trigger, causing child stack DELETE_FAILED.
+    DependsOn:
+      - CleanupStateMachine
+      - OrchestratorStateMachine
+      - ChildStackExecutionRole
+    Properties:
+      ServiceToken: !GetAtt CleanupTriggerFunction.Arn
+      OrchestratorStackId: !Ref AWS::StackId
+      OrchestratorStateMachineArn: !Ref OrchestratorStateMachine
+      CleanupStateMachineArn: !Ref CleanupStateMachine
+
+  ChildStackCleanupTriggerNoSharedRole:
+    Type: Custom::ChildStackCleanup
+    Condition: ShouldNotCreateSharedRole
+    DependsOn:
+      - CleanupStateMachine
+      - OrchestratorStateMachine
+    Properties:
+      ServiceToken: !GetAtt CleanupTriggerFunction.Arn
+      OrchestratorStackId: !Ref AWS::StackId
+      OrchestratorStateMachineArn: !Ref OrchestratorStateMachine
+      CleanupStateMachineArn: !Ref CleanupStateMachine
+
+  AutoStartExecution:
+    Type: Custom::AutoStartStateMachine
+    Condition: HasSNSEmailList
+    DependsOn:
+      - OrchestratorStateMachine
+      - OrchestratorLFAdmin
+      - OrchestratorFailureRule
+    Properties:
+      ServiceToken: !GetAtt AutoStartFunction.Arn
+      StateMachineArn: !Ref OrchestratorStateMachine
+      ExecutionInput:
+        S3CsvUrl: !Ref S3CsvUrl
+        ResultsBucket: !Ref ResultsBucket
+        StartS3BatchOperationsJobs: !Ref StartS3BatchOperationsJobs
+        TimeStamp: !Ref TimeStamp
+        Mode: !Ref Mode
+
+  AutoStartExecutionNoSNS:
+    Type: Custom::AutoStartStateMachine
+    Condition: HasNoSNSEmailList
+    DependsOn:
+      - OrchestratorStateMachine
+      - OrchestratorLFAdmin
+    Properties:
+      ServiceToken: !GetAtt AutoStartFunction.Arn
+      StateMachineArn: !Ref OrchestratorStateMachine
+      ExecutionInput:
+        S3CsvUrl: !Ref S3CsvUrl
+        ResultsBucket: !Ref ResultsBucket
+        StartS3BatchOperationsJobs: !Ref StartS3BatchOperationsJobs
+        TimeStamp: !Ref TimeStamp
+        Mode: !Ref Mode
+
+Outputs:
+  StateMachineArn:
+    Description: ARN of the orchestrator Step Functions state machine
+    Value: !Ref OrchestratorStateMachine
+
+  CleanupStateMachineArn:
+    Description: ARN of the cleanup Step Functions state machine
+    Value: !Ref CleanupStateMachine
+
+  ChildStackExecutionRoleArn:
+    Condition: ShouldCreateSharedRole
+    Description: ARN of the shared IAM role created for child stack Lambdas
+    Value: !GetAtt ChildStackExecutionRole.Arn

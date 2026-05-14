@@ -12,6 +12,7 @@
 - [Prerequisites](#prerequisites)
 - [Deploying and Running the Guidance](#deploying-and-running-the-guidance)
   - [Large-scale template (s3-rollback-glue-metadata.yaml)](#large-scale-template-s3-rollback-glue-metadatayaml)
+  - [Running against multiple buckets (s3-rollback-orchestrator.yaml)](#running-against-multiple-buckets-s3-rollback-orchestratoryaml)
 - [How it works](#how-it-works)
 - [Scenarios covered](#scenarios-covered)
   - [Bucket Rollback mode](#bucket-rollback-mode)
@@ -103,9 +104,10 @@ If using the large-scale template (`s3-rollback-glue-metadata.yaml`) with defaul
 3. A current inventory list of the bucket is required.
     - Ideally, [S3 Metadata live inventory](https://aws.amazon.com/blogs/aws/amazon-s3-metadata-now-supports-metadata-for-all-your-s3-objects/) is enabled on your bucket. For buckets with over a million objects, this is the fastest way for the tool to learn the current state of the bucket. [S3 Metadata](https://docs.aws.amazon.com/AmazonS3/latest/userguide/metadata-tables-overview.html) support has been tested up to 3 billion objects.
         - [Amazon S3 table buckets integration with AWS analytics services](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-integrating-aws.html) must be enabled.
-        - The tool automatically detects whether your account and region uses Lake Formation or IAM-based authorization for S3 Tables:
-            - **IAM mode** (S3 Metadata integration configured after approximately March 17, 2026): no Lake Formation administrator access is required.
-            - **LF mode** (S3 Metadata integration configured before approximately March 17, 2026): the IAM principal deploying the CloudFormation stack must be an [AWS Lake Formation data lake administrator](https://docs.aws.amazon.com/lake-formation/latest/dg/getting-started-setup.html#create-data-lake-admin), or must have been granted `SELECT` with grant option on the S3 Metadata table namespace by a Lake Formation administrator.
+        - The tool automatically detects the Lake Formation authorization mode for both the account-level Glue Data Catalog and the S3 Tables catalog (`s3tablescatalog`) independently, and grants only the permissions needed for each:
+            - **IAM mode** ([S3 Metadata integration configured after approximately March 17, 2026](https://aws.amazon.com/about-aws/whats-new/2026/03/gdc-simplified-permissions-s3tables-iceberg-views/)): no Lake Formation permissions are required.
+            - **LF mode** (S3 Metadata integration configured before approximately March 17, 2026): the IAM principal deploying the CloudFormation stack must have `lakeformation:PutDataLakeSettings` and `lakeformation:GetDataLakeSettings` IAM permissions. The tool temporarily elevates its Lambda role to [Lake Formation data lake administrator](https://docs.aws.amazon.com/lake-formation/latest/dg/getting-started-setup.html#create-data-lake-admin) during deployment and removes it on stack deletion.
+            - In mixed-mode environments (e.g. account in IAM mode but `s3tablescatalog` in LF mode), the tool grants permissions only where LF is enforcing.
         - If your S3 Metadata tables use a customer managed KMS key, specify it during deployment using the **S3 Metadata tables KMS key** parameter.
     - If S3 Metadata is not configured on your bucket, the tool will attempt to detect and use an existing [S3 Inventory](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html).
         - S3 Inventory reports are supported in [Parquet or Apache ORC](https://docs.aws.amazon.com/athena/latest/ug/columnar-storage.html) format, when including all versions as well as all [additional metadata](https://docs.aws.amazon.com/AmazonS3/latest/userguide/configure-inventory.html#configure-inventory-console). They must not be stored with [KMS encryption](https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingKMSEncryption.html). See [Deployment workflow](#deployment-workflow) for additional detail.
@@ -177,7 +179,7 @@ For buckets with more than 3 billion objects in scope, the standard template's A
 |---|---|---|
 | PIT (Point In Time) table computation | Athena SQL | AWS Glue Spark (Glue 5.1, 40 × G.8X workers by default) |
 | Inventory source | S3 Metadata, S3 Inventory, or CSV | S3 Metadata only |
-| Lake Formation admin required | No — auto-detected; LF admin required only for accounts in LF mode (S3 Metadata configured before March 17, 2026) | No — Glue accesses S3 Metadata via the Iceberg REST endpoint directly, bypassing Lake Formation permission grants |
+| Lake Formation permissions | No — auto-detected; `lakeformation:PutDataLakeSettings` and `lakeformation:GetDataLakeSettings` IAM permissions required only in LF mode ([S3 Metadata configured before March 17, 2026](https://aws.amazon.com/about-aws/whats-new/2026/03/gdc-simplified-permissions-s3tables-iceberg-views/)) | No — Glue accesses S3 Metadata via the Iceberg REST endpoint directly, bypassing Lake Formation permission grants |
 | Additional cost | — | ~$2 per billion objects in scope, for default worker configuration |
 
 **Deploying the large-scale template:**
@@ -188,6 +190,12 @@ Deploy `s3-rollback-glue-metadata.yaml` with the same parameters as the standard
 - **Number of workers**: Number of Glue workers. Default: 40 (equivalent to ~1,280 vCPU).
 
 All other parameters, outputs, and S3 Batch Operations jobs are identical to the standard template.
+
+## Running against multiple buckets (s3-rollback-orchestrator.yaml)
+
+To roll back, or remove delete markers across many buckets in one go, use [`s3-rollback-orchestrator.yaml`](s3-rollback-orchestrator.yaml). It takes a CSV of buckets (with optional prefix and S3 Metadata tables KMS key per row) and an HTTPS URL of the `s3-rollback.yaml` template in S3, then creates one child CloudFormation stack per bucket using a Step Functions state machine. All child stacks share the same timestamp, execution mode, and destination bucket.
+
+See [orchestrator.md](orchestrator.md) for the input CSV format, parameters, deployment walkthrough, results CSV format, and limitations.
 
 ## How it works
 
@@ -230,7 +238,7 @@ The tool requires an inventory of the bucket or prefix in scope. If none is avai
 - If the **Specify CSV inventory** CloudFormation stack parameter has an entry, the tool will read it from the specified S3 location. If it cannot read or process this file, the deployment will fail.
 - If not, the tool will look at the configuration of the selected bucket. If the bucket has an [S3 Metadata live inventory table](https://aws.amazon.com/blogs/aws/amazon-s3-metadata-now-supports-metadata-for-all-your-s3-objects/) configured and in active status, the tool will query the bucket's S3 Metadata tables (using any specified prefix as a filter).
     - [Amazon S3 table buckets integration with AWS analytics services](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-integrating-aws.html) must be enabled.
-    - The tool auto-detects the account and region's Lake Formation authorization mode and handles permission grants automatically. No Lake Formation administrator access is required in IAM mode (S3 Metadata configured after approximately March 17, 2026). In LF mode (configured before that date), the deploying principal must be a Lake Formation data lake administrator or hold grant option on the namespace.
+    - The tool auto-detects the Lake Formation authorization mode for the account-level Glue Data Catalog and the S3 Tables catalog independently, granting permissions only where LF is enforcing. No Lake Formation permissions are required when both are in IAM mode (S3 Metadata configured after approximately March 17, 2026). When either catalog is in LF mode, the deploying principal must have `lakeformation:PutDataLakeSettings` and `lakeformation:GetDataLakeSettings` IAM permissions.
     - If your S3 Metadata tables use a customer managed KMS key, specify it during deployment using the **S3 Metadata tables KMS key** parameter.
 - Otherwise, the tool looks at the bucket's S3 Inventory configuration. It evaluates the available S3 Inventory reports, and chooses the latest one that is in [Parquet or Apache ORC](https://docs.aws.amazon.com/athena/latest/ug/columnar-storage.html) format and includes all versions as well as all [additional metadata](https://docs.aws.amazon.com/AmazonS3/latest/userguide/configure-inventory.html#configure-inventory-console). If a prefix has been specified in the CloudFormation deployment, the tool will prioritize inventory configurations matching or containing the specified prefix. If no prefix was specified, there must be a valid S3 Inventory configuration containing all objects in the bucket, or the deployment will fail. 
 
@@ -379,18 +387,20 @@ For a simple demonstration example, costing $0.75-$1.00 (for the three to four S
 
 To return the state of a dataset to an earlier time, this tool exposes or copies desired versions of objects. **These desired versions must still exist**. Administrators can prevent the deletion of specific versions in Amazon S3 by denying use of the [DeleteObjectVersion](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html) and [PutLifeCycleConfiguration](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketLifecycleConfiguration.html) APIs with [bucket policies](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-policies.html), [access point policies](https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-points-policies.html), [service control policies (SCPs)](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_scps.html), or [resource control policies (RCPs)](https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_rcps.html), and/or by using [S3 Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html). For a complementary solution to assist with this, see [**Maintaining object immutability by automatically extending Amazon S3 Object Lock retention periods**](https://aws.amazon.com/blogs/storage/maintaining-object-immutability-by-automatically-extending-amazon-s3-object-lock-retention-periods/). You can also use [S3 Replication](https://docs.aws.amazon.com/AmazonS3/latest/userguide/replication.html) to make and maintain a copy of your data in another bucket (see [FAQ #9](#faqs)).
 
+If you rely on [S3 Metadata live inventory tables](https://docs.aws.amazon.com/AmazonS3/latest/userguide/metadata-tables-overview.html) to accelerate recovery, consider also denying use of the S3 Metadata configuration APIs with the same policy mechanisms. Deletion of the metadata configuration or disabling the inventory table will remove the live inventory the tool relies on. The relevant IAM actions are `s3:DeleteBucketMetadataTableConfiguration` (covers both the V1 `DeleteBucketMetadataTableConfiguration` and V2 `DeleteBucketMetadataConfiguration` API operations) and [`s3:UpdateBucketMetadataInventoryTableConfiguration`](https://docs.aws.amazon.com/AmazonS3/latest/API/API_UpdateBucketMetadataInventoryTableConfiguration.html). The underlying AWS managed table bucket (named `aws-s3`) and its tables are managed by AWS with [read-only access](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-aws-managed-buckets.html) for users, so no additional S3 Tables permissions need to be denied.
+
 
 ## KMS permissions
 
-With the exception of the (optional) KMS key specified for use with S3 Metadata tables, the roles created by this tool **will not have IAM or KMS permissions to any KMS keys**. If you have objects in scope that are encrypted with KMS, or you have specified that the solution should use a KMS key when copying objects, or your bucket has default encryption set to a KMS key, you will need to update permissions before starting the Batch Operations copy jobs (Scenarios 3 and 5). The ARNs that require permissions are shown in the `CopyRole3b`, `CopyRole3c` and `CopyRole5b` output of the CloudFormation stack.
+The roles created by this tool **will not have IAM or KMS permissions to any KMS keys used for object encryption**. If you have objects in scope that are encrypted with a customer managed KMS key, or your bucket has default SSE-KMS encryption, you will need to grant the copy roles permission before starting the Batch Operations copy jobs (Scenarios 3 and 5). The ARNs that require permissions are shown in the `CopyRole3b`, `CopyRole3c` and `CopyRole5b` outputs of the CloudFormation stack.
 
-Permissions required:
-- KMS decrypt for object versions to be copied
-- KMS encrypt for the key you selected copies to be encrypted with (or the bucket default)
+Permissions required on the object encryption key:
+- `kms:Decrypt` — to read the source object versions being copied
+- `kms:GenerateDataKey` — to encrypt the new object versions written by the copy job (using the key you specified, or the bucket default)
 
-KMS permissions are *not* required for scenario 1, 2 and 4 jobs, as DELETE operations do not encrypt or decrypt data.
+KMS permissions are *not* required for scenario 1, 2 and 4 jobs, as DELETE operations do not encrypt or decrypt object data.
 
-If you specify an `S3 Metadata tables KMS key` during deployment, the new `MetadataFinderRole` will be granted `kms:Decrypt`, `kms:GenerateDataKey` and `kms:DescribeKey` on this key. These permissions will be removed when the CloudFormation stack is deleted.
+The **S3 Metadata tables KMS key** is separate. If your S3 Metadata tables (journal and inventory) are encrypted with a customer managed KMS key, specify it during deployment using the `S3 Metadata tables KMS key` parameter. The tool will automatically grant `kms:Decrypt`, `kms:GenerateDataKey` and `kms:DescribeKey` on this key to the roles that query the metadata tables. These permissions are removed when the CloudFormation stack is deleted.
 
 ## AWS Lambda concurrency reservations
 
@@ -437,6 +447,9 @@ The Lambda functions created by this tool (for use with S3 Batch Operations) hav
     - Note that the tool uses the 'last modified' date of each object (i.e. when it was created), and this date is maintained when objects are replicated. Therefore, when rolling back a destination bucket you need to be conscious that actions are calculated according to the date an object was *created*, **not** the date it was *replicated*.
 10. For 'Copy to Bucket' mode, why does the destination bucket need S3 Versioning enabled?
     - This tool will copy objects into the destination bucket without considering the current state of objects in the destination. If versioning is not enabled, these copies could result in overwrites causing permanent and irreversable data loss.
+11. Are all object keys supported?
+    - Object keys containing most characters (including spaces, `+`, `%`, and UTF-8 bytes) are handled correctly — the tool URL-encodes keys using Trino's `url_encode()` when building S3 Batch Operations manifests, and S3 Batch Operations decodes them unambiguously.
+    - However, object keys containing line feed (`\n`, `0x0A`) or carriage return (`\r`, `0x0D`) bytes are not supported by S3 Batch Operations even when URL-encoded. Tasks for such keys will fail with the error `URL-encoded key contains line feed and/or carriage return characters not currently supported by S3 Batch Operations`. Any objects with such keys will need to be recovered by another means.
 
 
 ## Cleanup
@@ -485,7 +498,12 @@ To clean up, delete the CloudFormation stack. This will delete any CSV manifests
 - 2026-03-31
     - Added IAM mode auto-detection to `s3-rollback.yaml` and `s3-rollback-glue-metadata.yaml`: a new `LFPermissionsGranter` Lambda-backed custom resource replaces the static `AWS::LakeFormation::PrincipalPermissions` and `AWS::LakeFormation::Permissions` resources
     - Both templates now work in accounts and regions using IAM-based authorization for S3 Tables (configured after approximately March 17, 2026) without requiring Lake Formation administrator permissions
-    - Lake Formation grants are still made automatically in LF-mode accounts and regions (configured before that date); the deploying principal must still be an LF administrator or hold grant option in that case
+    - Lake Formation grants are still made automatically in LF-mode accounts and regions (configured before that date); the deploying principal must have `lakeformation:PutDataLakeSettings` and `lakeformation:GetDataLakeSettings` IAM permissions
+- 2026-04-19 - Documented object key support in FAQs, including the S3 Batch Operations limitation for keys containing line feed or carriage return bytes
+- 2026-05-14
+    - Added `s3-rollback-orchestrator.yaml`: a Step Functions orchestrator that deploys `s3-rollback.yaml` across many buckets from a single CSV input. Uses a Distributed Map with STANDARD child executions (one per CSV row, up to 50 in parallel) so each row has its own history budget and the parent execution scales to any row count. Child outputs are written to S3 and consolidated into a results CSV. Rows are launched in staggered batches of 5 every 15 seconds to spread CloudFormation, Athena, and Lake Formation load at startup. Per-stack poll interval is 30 seconds; timeout is ~60 minutes. All CloudFormation API calls use exponential backoff (up to 8 retries). The input CSV supports comma-separated prefixes in a single row (e.g. `a/,b/`), each producing its own child stack. Optional `SNSEmailList` parameter creates an SNS topic and EventBridge rules that notify subscribers when the orchestrator or cleanup state machine terminates abnormally. Cleanup uses a Distributed Map with a retry path for stuck child stacks. Child stacks can share a single IAM role (`CreateSharedIAMRole` / `SharedIAMRoleArn`) instead of each creating their own, keeping IAM role count manageable at scale. See [orchestrator.md](orchestrator.md).
+    - Lake Formation: `LFPermissionsGranter` detects LF mode independently at the account level and `s3tablescatalog` level, granting permissions only where LF is enforcing. It is temporarily elevated to LF admin via `AWS::LakeFormation::DataLakeSettings` with `MutationType: APPEND` (removed on stack deletion), or assumes the orchestrator's LF admin role via STS when `LFAdminRoleArn` is provided. Grants include `DESCRIBE` on the S3 Metadata namespace table wildcard (required by Athena) and `ALL` on S3 Tables namespaces. The elevation uses a Lambda-backed custom resource (`LFAdminGranterFunction`) with exponential backoff on `ConcurrentModificationException`. `AWS::LakeFormation::PrincipalPermissions` is no longer used — it cannot reference federated catalogs, so `lakeformation:PutDataLakeSettings` and `lakeformation:GetDataLakeSettings` are always required in LF mode.
+    - KMS: `QueryExecutorRole` receives the same KMS grants as `MetadataFinderRole` on the S3 Metadata tables key (required when per-stack roles are used). `KMSUpdateFunction` scrubs orphaned IAM principal IDs from key policies before calling `PutKeyPolicy` and retries with exponential backoff on `MalformedPolicyDocumentException` to handle IAM propagation delay.
 
 ## Notices
 
@@ -498,5 +516,5 @@ This library is licensed under the MIT-0 License. See the [LICENSE](LICENSE) fil
 * Ed Gummett, Senior Storage Specialist Solutions Architect, AWS. [Connect on LinkedIn.](https://www.linkedin.com/in/egummett/)
 * Paul Gargan, Senior Solutions Architect, AWS.
 * Tom Bailey, Senior Technical Account Manager, AWS. [Connect on LinkedIn.](https://www.linkedin.com/in/tom-bailey-1633866/)
-* Karim Omar, Cloud Support Engineer, AWS.
+* Karim Omar, Cloud Support Engineer, AWS. [Connect on LinkedIn.](https://www.linkedin.com/in/karim-omar-374a2140a/)
 

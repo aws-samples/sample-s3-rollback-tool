@@ -76,6 +76,31 @@ Parameters:
   ExistingKmsKeyIdOrArn:
     Type: String
     Description: Only provide when Metadata is encrypted by Customer managed Key, leave empty if Metadata is SSE-S3 Encrypted.
+    Default: ""
+
+  SharedIAMRoleArn:
+    Type: String
+    Description: Optional ARN of a shared IAM role. When provided, this role is used instead of creating per-stack roles.
+    Default: ""
+
+  LFAdminRoleArn:
+    Type: String
+    Description: >-
+      Optional ARN of an IAM role that is already a Lake Formation data lake administrator.
+      When provided, the LFPermissionsGranter Lambda runs as this role to make LF grants,
+      avoiding the need to elevate a per-stack role to LF admin. Intended for use by the
+      orchestrator, which passes its own LambdaExecutionRole (already an LF admin via
+      OrchestratorLFAdmin). Has no effect in IAM mode accounts where LF grants are not needed.
+    Default: ""
+
+  SharedAthenaWorkGroupName:
+    Type: String
+    Description: >-
+      Optional name of a pre-existing Athena WorkGroup to use instead of creating a new one.
+      When provided, no WorkGroup is created by this stack. Intended for use by the orchestrator,
+      which pre-creates a fixed pool of WorkGroups and passes one per child stack to stay within
+      the per-account WorkGroup quota. Leave blank when deploying this template directly.
+    Default: ""
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -124,6 +149,8 @@ Metadata:
 
 Conditions:
   UseKmsUpdateKeyPolicy: !Not [!Equals [!Ref ExistingKmsKeyIdOrArn, ""]]
+  UseSharedWorkGroup: !Not [!Equals [!Ref SharedAthenaWorkGroupName, ""]]
+  CreateOwnWorkGroup: !Equals [!Ref SharedAthenaWorkGroupName, ""]
   CreateInventory: !Equals
     - !Ref InventoryCSVLocation
     - ""
@@ -175,6 +202,20 @@ Conditions:
     - "YES"
 
   CreateKMSUpdate: !Not [!Equals [!Ref ExistingKmsKeyIdOrArn, ""]]
+
+  UseSharedIAMRole: !Not [!Equals [!Ref SharedIAMRoleArn, ""]]
+  CreateOwnRoles: !Not [!Condition UseSharedIAMRole]
+  HasLFAdminRole: !Not [!Equals [!Ref LFAdminRoleArn, ""]]
+  # CreateOwnLFAdmin: need to elevate a per-stack role to LF admin only when
+  # neither a shared IAM role nor an external LF admin role is provided.
+  # The orchestrator passes LFAdminRoleArn so child stacks never add LF admins.
+  CreateOwnLFAdmin: !And [!Condition CreateOwnRoles, !Not [!Condition HasLFAdminRole]]
+  CreateOwnMetadataFinderRole: !And [!Condition CreateInventoryFromMetadata, !Condition CreateOwnRoles]
+  CreateOwnInventoryFinderRole: !And [!Condition CreateInventory, !Condition CreateOwnRoles]
+  CreateOwnInventoryCopierRole: !And [!Condition UseInventoryCSV, !Condition CreateOwnRoles]
+  CreateOwnS3BatchOpsDeleteFunctionRole: !And [!Condition WantRollbackOrDMRemoval, !Condition CreateOwnRoles]
+  CreateOwnS3BatchOpsCopyFunctionRole: !And [!Condition WantRollbackOrCopy, !Condition CreateOwnRoles]
+  CreateOwnKMSUpdateFunctionRole: !And [!Condition CreateKMSUpdate, !Condition CreateOwnRoles]
   CreateMetadataFinderWithKMSUpdate: !And
     - !Condition CreateInventoryFromMetadata
     - !Condition CreateKMSUpdate
@@ -205,7 +246,7 @@ Resources:
       MemorySize: 1024
       Timeout: 900
       Handler: "index.handler"
-      Role: !GetAtt BucketCleanerRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt BucketCleanerRole.Arn]
       Code:
         ZipFile: |
           import cfnresponse
@@ -251,6 +292,7 @@ Resources:
 
   BucketCleanerRole:
     Type: "AWS::IAM::Role"
+    Condition: CreateOwnRoles
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -291,7 +333,7 @@ Resources:
       MemorySize: 128
       Timeout: 60
       Handler: "index.handler"
-      Role: !GetAtt CheckVersioningRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt CheckVersioningRole.Arn]
       Code:
         ZipFile: |
           import cfnresponse
@@ -342,6 +384,7 @@ Resources:
 
   CheckVersioningRole:
     Type: "AWS::IAM::Role"
+    Condition: CreateOwnRoles
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -387,6 +430,7 @@ Resources:
         
   LFPermissionsGranterRole:
     Type: AWS::IAM::Role
+    Condition: CreateOwnRoles
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -403,15 +447,118 @@ Resources:
               - Effect: Allow
                 Action:
                   - lakeformation:GetDataLakeSettings
+                  - lakeformation:PutDataLakeSettings
+                  - lakeformation:GetDataAccess
                   - lakeformation:GrantPermissions
                   - lakeformation:RevokePermissions
                 Resource: "*"
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetCatalog
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog/*"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/*"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/*"
+              - Effect: Allow
+                Action:
+                  - s3tables:GetTableBucket
+                  - s3tables:GetNamespace
+                  - s3tables:GetTable
+                  - s3tables:ListNamespaces
+                  - s3tables:ListTables
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/aws-s3"
+                  - !Sub "arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/aws-s3/table/*"
               - Effect: Allow
                 Action:
                   - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+
+  # LFAdminGranterFunction replaces the native AWS::LakeFormation::DataLakeSettings
+  # resource for the own-roles case. The native resource calls PutDataLakeSettings
+  # once with no retry; when multiple child stacks deploy in parallel they all race
+  # to modify the same LF settings and most fail with ConcurrentModificationException.
+  # This Lambda retries with exponential backoff until it succeeds or times out.
+  LFAdminGranterFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateOwnLFAdmin
+    Properties:
+      Runtime: python3.13
+      MemorySize: 128
+      Timeout: 120
+      Handler: index.handler
+      Role: !GetAtt LFPermissionsGranterRole.Arn
+      Code:
+        ZipFile: |
+          import time
+          import random
+          import boto3
+          import cfnresponse
+
+          lf = boto3.client("lakeformation")
+
+          def handler(event, context):
+              principal_arn = event["ResourceProperties"]["PrincipalArn"]
+              request_type  = event["RequestType"]
+              try:
+                  if request_type == "Create":
+                      _append_admin(principal_arn)
+                  elif request_type == "Delete":
+                      _remove_admin(principal_arn)
+                  # Update: no-op (principal ARN is immutable)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                   {"PrincipalArn": principal_arn},
+                                   physicalResourceId=principal_arn)
+              except Exception as exc:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {},
+                                   reason=str(exc))
+
+          def _put_with_retry(new_settings, max_attempts=10):
+              """Call PutDataLakeSettings, retrying on ConcurrentModificationException."""
+              for attempt in range(max_attempts):
+                  try:
+                      lf.put_data_lake_settings(DataLakeSettings=new_settings)
+                      return
+                  except lf.exceptions.ConcurrentModificationException:
+                      if attempt == max_attempts - 1:
+                          raise
+                      # Exponential backoff with jitter: 1-2s, 2-4s, 4-8s ...
+                      sleep = (2 ** attempt) + random.uniform(0, 1)
+                      print(f"ConcurrentModificationException on attempt {attempt+1}, "
+                            f"retrying in {sleep:.1f}s ...")
+                      time.sleep(sleep)
+
+          def _append_admin(principal_arn):
+              current = lf.get_data_lake_settings()["DataLakeSettings"]
+              admins  = current.get("DataLakeAdmins", [])
+              if any(a["DataLakePrincipalIdentifier"] == principal_arn for a in admins):
+                  print(f"Principal {principal_arn} is already an LF admin, skipping.")
+                  return
+              admins.append({"DataLakePrincipalIdentifier": principal_arn})
+              current["DataLakeAdmins"] = admins
+              _put_with_retry(current)
+              print(f"Added {principal_arn} as LF admin.")
+
+          def _remove_admin(principal_arn):
+              current = lf.get_data_lake_settings()["DataLakeSettings"]
+              admins  = [a for a in current.get("DataLakeAdmins", [])
+                         if a["DataLakePrincipalIdentifier"] != principal_arn]
+              current["DataLakeAdmins"] = admins
+              _put_with_retry(current)
+              print(f"Removed {principal_arn} from LF admins.")
+
+  LFPermissionsGranterAdmin:
+    Type: Custom::LFAdminGranter
+    Condition: CreateOwnLFAdmin
+    Properties:
+      ServiceTimeout: 120
+      ServiceToken: !GetAtt LFAdminGranterFunction.Arn
+      PrincipalArn: !GetAtt LFPermissionsGranterRole.Arn
 
   LFPermissionsGranter:
     Type: AWS::Lambda::Function
@@ -420,14 +567,31 @@ Resources:
       MemorySize: 128
       Timeout: 60
       Handler: index.handler
-      Role: !GetAtt LFPermissionsGranterRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt LFPermissionsGranterRole.Arn]
       Code:
         ZipFile: |
           import json
           import boto3
           import cfnresponse
+          import os
 
-          lf = boto3.client("lakeformation")
+          def get_lf_client(props):
+              """Return an LF client. If LFAdminRoleArn is provided, assume that role."""
+              lf_admin_role = props.get("LFAdminRoleArn", "")
+              if lf_admin_role:
+                  sts = boto3.client("sts")
+                  creds = sts.assume_role(
+                      RoleArn=lf_admin_role,
+                      RoleSessionName="LFPermissionsGranter"
+                  )["Credentials"]
+                  return boto3.client("lakeformation",
+                      aws_access_key_id=creds["AccessKeyId"],
+                      aws_secret_access_key=creds["SecretAccessKey"],
+                      aws_session_token=creds["SessionToken"]
+                  )
+              return boto3.client("lakeformation")
+
+          glue = boto3.client("glue")
 
           def handler(event, context):
               request_type = event["RequestType"]
@@ -452,11 +616,22 @@ Resources:
                   return "IAM_Mode"
               return "LF_Mode"
 
+          def detect_catalog_mode(catalog_id):
+              try:
+                  response = glue.get_catalog(CatalogId=catalog_id)
+                  catalog = response.get("Catalog", {})
+                  defaults = catalog.get("CreateTableDefaultPermissions", [])
+                  return detect_mode({"CreateTableDefaultPermissions": defaults})
+              except Exception:
+                  return "LF_Mode"
+
           def handle_create(event, context, props):
-              settings = lf.get_data_lake_settings(CatalogId=props["DatabaseCatalogId"])
-              mode = detect_mode(settings["DataLakeSettings"])
+              lf = get_lf_client(props)
+              account_settings = lf.get_data_lake_settings(CatalogId=props["DatabaseCatalogId"])
+              account_mode = detect_mode(account_settings["DataLakeSettings"])
               grants = []
-              if mode == "LF_Mode":
+
+              if account_mode == "LF_Mode":
                   lf.grant_permissions(
                       CatalogId=props["DatabaseCatalogId"],
                       Principal={"DataLakePrincipalIdentifier": props["PrincipalArn"]},
@@ -474,31 +649,55 @@ Resources:
                       "principalArn": props["PrincipalArn"],
                       "permissions": ["CREATE_TABLE"]
                   })
-                  namespace = props.get("NameSpace", "default")
-                  if namespace != "default":
-                      ns_catalog_id = f"{props['DatabaseCatalogId']}:s3tablescatalog/aws-s3"
+
+              namespace = props.get("NameSpace", "default")
+              if namespace != "default":
+                  s3tables_catalog_id = f"{props['DatabaseCatalogId']}:s3tablescatalog/aws-s3"
+                  catalog_mode = detect_catalog_mode(s3tables_catalog_id)
+                  if catalog_mode == "LF_Mode":
+                      # Grant ALL on the S3 Tables namespace (database-level grant).
                       lf.grant_permissions(
-                          CatalogId=props["DatabaseCatalogId"],
+                          Principal={"DataLakePrincipalIdentifier": props["PrincipalArn"]},
+                          Resource={"Database": {
+                              "CatalogId": s3tables_catalog_id,
+                              "Name": namespace
+                          }},
+                          Permissions=["ALL"],
+                          PermissionsWithGrantOption=["ALL"]
+                      )
+                      grants.append({
+                          "type": "s3tables_database",
+                          "catalogId": s3tables_catalog_id,
+                          "databaseName": namespace,
+                          "principalArn": props["PrincipalArn"],
+                          "permissions": ["ALL"]
+                      })
+                      # Grant SELECT/DESCRIBE on all tables in the namespace so
+                      # Athena can read the inventory and journal tables.
+                      lf.grant_permissions(
                           Principal={"DataLakePrincipalIdentifier": props["PrincipalArn"]},
                           Resource={"Table": {
-                              "CatalogId": ns_catalog_id,
+                              "CatalogId": s3tables_catalog_id,
                               "DatabaseName": namespace,
                               "TableWildcard": {}
                           }},
-                          Permissions=["SELECT"],
+                          Permissions=["SELECT", "DESCRIBE"],
                           PermissionsWithGrantOption=[]
                       )
                       grants.append({
-                          "type": "tableWildcard",
-                          "catalogId": ns_catalog_id,
+                          "type": "s3tables_tableWildcard",
+                          "catalogId": s3tables_catalog_id,
                           "databaseName": namespace,
                           "principalArn": props["PrincipalArn"],
-                          "permissions": ["SELECT"]
+                          "permissions": ["SELECT", "DESCRIBE"]
                       })
+
               physical_id = json.dumps({"grants": grants})
               cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physicalResourceId=physical_id)
 
           def handle_delete(event, context):
+              props = event.get("ResourceProperties", {})
+              lf = get_lf_client(props)
               physical_id = event.get("PhysicalResourceId", "{}")
               try:
                   state = json.loads(physical_id)
@@ -515,11 +714,13 @@ Resources:
                           Permissions=grant["permissions"],
                           PermissionsWithGrantOption=[]
                       )
-                  except lf.exceptions.InvalidInputException as e:
-                      if "AlreadyRevoked" in str(e) or "not found" in str(e).lower():
-                          pass
-                      else:
-                          raise
+                  except Exception as e:
+                      # Treat all revocation failures as non-fatal. Common cases:
+                      # - Grant already revoked (AlreadyRevoked / not found)
+                      # - Execution role no longer exists (orchestrator stack deleted
+                      #   before child stack cleanup completed) — grants are already
+                      #   inaccessible in this case so skipping is correct.
+                      print(f"Warning: could not revoke LF grant {grant}: {e}")
               cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
 
           def build_resource(grant):
@@ -528,7 +729,12 @@ Resources:
                       "CatalogId": grant["catalogId"],
                       "Name": grant["databaseName"]
                   }}
-              elif grant["type"] == "tableWildcard":
+              elif grant["type"] == "s3tables_database":
+                  return {"Database": {
+                      "CatalogId": grant["catalogId"],
+                      "Name": grant["databaseName"]
+                  }}
+              elif grant["type"] in ("tableWildcard", "s3tables_tableWildcard"):
                   return {"Table": {
                       "CatalogId": grant["catalogId"],
                       "DatabaseName": grant["databaseName"],
@@ -539,26 +745,41 @@ Resources:
     Type: Custom::LFPermissionsGranter
     DependsOn:
       - GlueDatabase
-      - QueryExecutorRole
     Properties:
+      ServiceTimeout: 60
       ServiceToken: !GetAtt LFPermissionsGranter.Arn
-      PrincipalArn: !GetAtt QueryExecutorRole.Arn
+      PrincipalArn: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt QueryExecutorRole.Arn]
       DatabaseCatalogId: !Ref AWS::AccountId
       DatabaseName: !Ref GlueDatabase
+      LFAdminRoleArn: !If [HasLFAdminRole, !Ref LFAdminRoleArn, ""]
       NameSpace: !If [CreateInventoryFromMetadata,
                    !If [CreateKMSUpdate,
                      !GetAtt ExecuteMetadataFinderWithKMSUpdate.NameSpace,
                      !GetAtt ExecuteMetadataFinderNoKMSUpdate.NameSpace],
                    "default"]
+      # Passing this output as a property creates an implicit dependency so
+      # the QueryExecutor KMS grant completes before LF permissions are granted.
+      # The value is ignored by the Lambda handler.
+      KMSQueryExecutorGranted: !If [CreateOwnKMSUpdateFunctionRole,
+                                    !GetAtt KMSUpdateQueryExecutor.StatementSid,
+                                    "n/a"]
+      # Implicit dependency: ensure LFPermissionsGranterAdmin completes (elevating
+      # LFPermissionsGranterRole to LF admin) before this resource makes LF grants.
+      # When LFAdminRoleArn is provided or shared role is used, CreateOwnLFAdmin is
+      # false so LFPermissionsGranterAdmin doesn't exist — use a literal placeholder.
+      LFAdminReady: !If [CreateOwnLFAdmin,
+                         !GetAtt LFPermissionsGranterAdmin.PrincipalArn,
+                         "n/a"]
 
   AthenaWorkGroup:
     Type: "AWS::Athena::WorkGroup"
+    Condition: CreateOwnWorkGroup
     Properties:
       Name: !Join [ "_", [ "s3_rollback_wg", !Join [ "_", !Split [ "-", !Select [ 2, !Split [ "/", !Ref "AWS::StackId" ] ] ] ] ] ]
       Description: !Sub "WorkGroup for the S3 Rollback '${AWS::StackName}' CloudFormation Stack"
       RecursiveDeleteOption: true
-      WorkGroupConfiguration: 
-        EnforceWorkGroupConfiguration: false 
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: false
 
   MetadataFinder:
     Type: "AWS::Lambda::Function"
@@ -568,7 +789,7 @@ Resources:
       MemorySize: 1024
       Timeout: 60
       Handler: "index.handler"
-      Role: !GetAtt MetadataFinderRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt MetadataFinderRole.Arn]
       Code:
         ZipFile: |
           import cfnresponse
@@ -680,7 +901,7 @@ Resources:
 
   MetadataFinderRole:
     Type: "AWS::IAM::Role"
-    Condition: CreateInventoryFromMetadata
+    Condition: CreateOwnMetadataFinderRole
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -739,7 +960,7 @@ Resources:
       MemorySize: 1024
       Timeout: 60
       Handler: "index.handler"
-      Role: !GetAtt InventoryFinderRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt InventoryFinderRole.Arn]
       Code:
         ZipFile: |
           import cfnresponse
@@ -903,7 +1124,7 @@ Resources:
 
   InventoryFinderRole:
     Type: "AWS::IAM::Role"
-    Condition: CreateInventory
+    Condition: CreateOwnInventoryFinderRole
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -948,7 +1169,7 @@ Resources:
       MemorySize: 1024
       Timeout: 900
       Handler: "index.handler"
-      Role: !GetAtt InventoryCopierRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt InventoryCopierRole.Arn]
       Code:
         ZipFile: |
           import cfnresponse
@@ -999,7 +1220,7 @@ Resources:
             
   InventoryCopierRole:
     Type: "AWS::IAM::Role"
-    Condition: UseInventoryCSV
+    Condition: CreateOwnInventoryCopierRole
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -1042,7 +1263,7 @@ Resources:
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Amazon Athena table to hold an Amazon S3 Inventory"
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       QueryString: !Sub
         - |
             -- Creates an Amazon Athena table to hold an Amazon S3 Inventory
@@ -1093,7 +1314,7 @@ Resources:
     Properties:
       Database: !Ref GlueDatabase
       Description: "Loads an inventory in CSV format into a temporary table"
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       QueryString: !Sub
         - |
             -- Loads an inventory in CSV format into a temporary table
@@ -1123,7 +1344,7 @@ Resources:
     Properties:
       Database: !Ref GlueDatabase
       Description: "Checks to ensure the CSV table only has records from the correct bucket"
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       QueryString: !Sub
         - |
             -- Checks to ensure the CSV table only has records from the correct bucket
@@ -1144,7 +1365,7 @@ Resources:
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates the initial Point in Time table based on the CSV Import table"
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       QueryString: !Sub
         - |
             -- Creates the initial Point in Time table based on the CSV Import table
@@ -1176,7 +1397,7 @@ Resources:
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates the initial Point in Time table based on the bucket's Metadata table"
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       QueryString: !Sub
         - |
             -- Creates the initial Point in Time table based on the bucket's Metadata table
@@ -1460,7 +1681,7 @@ Resources:
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Amazon Athena table to hold an Amazon S3 Inventory from a single dt= prefix"
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       QueryString: !Sub
         - |
             -- Creates an Amazon Athena table to hold an Amazon S3 Inventory from a single dt= prefix.
@@ -1498,7 +1719,7 @@ Resources:
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Amazon Athena table to hold the distinct list of keys"
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       QueryString: !Sub
         - |
             -- Creates "All Keys" table, which holds the distinct list of keys.
@@ -1522,7 +1743,7 @@ Resources:
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Amazon Athena table to hold the latest versions of every file under the prefix"
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       QueryString: !Sub
         - |
             -- Creates "Latest Versions" table, which holds the list of most recent versions.
@@ -1555,7 +1776,7 @@ Resources:
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Amazon Athena table to hold the desired version / delete markers of every file under the prefix"
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       QueryString: !Sub
         - |
             -- Create "Desired", which holds the list of versions / delete markers immediately before the point in time.
@@ -1591,7 +1812,7 @@ Resources:
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Amazon Athena table to hold the desired versions of every file under the prefix"
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       QueryString: !Sub
         - |
             -- Create "Desired Versions", which holds the list of versions immediately before the point in time.
@@ -1618,7 +1839,7 @@ Resources:
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Athena table to hold the list of keys that have changed"
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       QueryString: !Sub
         - |
             -- Creates an Athena table to hold the list of keys that have changed
@@ -1652,7 +1873,7 @@ Resources:
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Athena table to count an object's versions"
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       QueryString: !Sub
         - |
             -- Creates an Athena table to count an object's Versions
@@ -1687,7 +1908,7 @@ Resources:
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Athena table listing all DMs that are the latest object version"
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       QueryString: !Sub
         - |
             -- Creates an Athena table listing all DMs that are created after the PIT, with no subsequent object versions
@@ -1735,7 +1956,7 @@ Resources:
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Athena table to address Scenario 1"
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       QueryString: !Sub
         - |
             -- Creates an Athena table to address Scenario 1;
@@ -1792,7 +2013,7 @@ Resources:
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Athena table to address Scenario 2"
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       QueryString: !Sub
         - |
             -- Creates an Athena table to address Scenario 2;
@@ -1830,7 +2051,7 @@ Resources:
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Athena table to *undo* Scenario 2"
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       QueryString: !Sub
         - |
             -- Creates an Athena table to *undo* Scenario 2;
@@ -1858,7 +2079,7 @@ Resources:
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Athena table to address Scenario 3a"
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       QueryString: !Sub
         - |
             -- Creates an Athena table to address Scenario 3a;
@@ -1896,7 +2117,7 @@ Resources:
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Athena table to address Scenario 3b"
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       QueryString: !Sub
         - |
             -- Creates an Athena table to address Scenario 3b;
@@ -1933,7 +2154,7 @@ Resources:
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Athena table to address Scenario 3c"
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       QueryString: !Sub
         - |
             -- Creates an Athena table to address Scenario 3c;
@@ -1970,7 +2191,7 @@ Resources:
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Athena table to address Scenario 4"
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       QueryString: !Sub
         - |
             -- Creates an Athena table to address Scenario 4;
@@ -2000,7 +2221,7 @@ Resources:
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Athena table to *undo* Scenario 4"
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       QueryString: !Sub
         - |
             -- Creates an Athena table to *undo* Scenario 4;
@@ -2028,7 +2249,7 @@ Resources:
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Athena table to address Scenario 5a"
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       QueryString: !Sub
         - |
             -- Creates an Athena table to address Scenario 5a;
@@ -2061,7 +2282,7 @@ Resources:
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Athena table to address Scenario 5b"
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       QueryString: !Sub
         - |
             -- Creates an Athena table to address Scenario 5b;
@@ -2095,7 +2316,7 @@ Resources:
       MemorySize: 1024
       Timeout: 900
       Handler: "index.handler"
-      Role: !GetAtt ManifestMakerRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt ManifestMakerRole.Arn]
       Code:
         ZipFile: |
           import cfnresponse
@@ -2258,6 +2479,7 @@ Resources:
   
   ManifestMakerRole:
     Type: "AWS::IAM::Role"
+    Condition: CreateOwnRoles
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -2299,7 +2521,7 @@ Resources:
       MemorySize: 1024
       Timeout: 900
       Handler: "index.handler"
-      Role: !GetAtt QueryExecutorRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt QueryExecutorRole.Arn]
       Code:
         ZipFile: |
           import cfnresponse
@@ -2391,6 +2613,7 @@ Resources:
           
   QueryExecutorRole:
     Type: "AWS::IAM::Role"
+    Condition: CreateOwnRoles
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -2423,7 +2646,9 @@ Resources:
                   - "athena:GetQueryExecution"
                   - "athena:GetQueryResults"
                 Resource:
-                  - !Sub "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AthenaWorkGroup}"
+                  - !Sub
+                    - "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${WGName}"
+                    - WGName: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
               - Effect: Allow
                 Action:
                   - "athena:GetDataCatalog"
@@ -2493,7 +2718,7 @@ Resources:
       MemorySize: 1024
       Timeout: 60
       Handler: "index.handler"
-      Role: !GetAtt QueryExecutorRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt QueryExecutorRole.Arn]
       Code:
         ZipFile: |
           import cfnresponse
@@ -2590,7 +2815,7 @@ Resources:
       MemorySize: 1024
       Timeout: 60
       Handler: "index.handler"
-      Role: !GetAtt S3BatchOpsCreatorRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsCreatorRole.Arn]
       Code:
         ZipFile: |
           import cfnresponse
@@ -2778,6 +3003,7 @@ Resources:
 
   S3BatchOpsCreatorRole:
     Type: "AWS::IAM::Role"
+    Condition: CreateOwnRoles
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -2826,10 +3052,11 @@ Resources:
                 Action:
                   - "iam:PassRole"
                 Resource:
-                  - !GetAtt S3BatchOpsExecutorRole.Arn
+                  - !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsExecutorRole.Arn]
         
   S3BatchOpsExecutorRole:
     Type: "AWS::IAM::Role"
+    Condition: CreateOwnRoles
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -2872,7 +3099,7 @@ Resources:
       MemorySize: 256
       Timeout: 900
       Handler: "index.handler"
-      Role: !GetAtt S3BatchOpsDeleteFunctionRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsDeleteFunctionRole.Arn]
       Code:
         ZipFile: |
           import boto3
@@ -2944,7 +3171,7 @@ Resources:
               return results
 
   S3BatchOpsDeleteFunctionRole:
-    Condition: WantRollbackOrDMRemoval
+    Condition: CreateOwnS3BatchOpsDeleteFunctionRole
     Type: "AWS::IAM::Role"
     Properties:
       AssumeRolePolicyDocument:
@@ -2986,7 +3213,7 @@ Resources:
       MemorySize: 2048
       Timeout: 900
       Handler: "index.handler"
-      Role: !GetAtt S3BatchOpsCopyFunctionRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsCopyFunctionRole.Arn]
       Code:
         ZipFile: |
           import boto3
@@ -3065,7 +3292,7 @@ Resources:
 
   S3BatchOpsCopyFunctionRole:
     Type: "AWS::IAM::Role"
-    Condition: WantRollbackOrCopy
+    Condition: CreateOwnS3BatchOpsCopyFunctionRole
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -3166,7 +3393,7 @@ Resources:
       ServiceTimeout: 900
       ServiceToken: !GetAtt QueryExecutor.Arn
       QueryID: !GetAtt CreateInventoryPITTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateInventoryPITTable/"
       SkipIfMetadataFound: true
       NameSpace: !If [ CreateInventoryFromMetadata, !If [ CreateKMSUpdate, !GetAtt ExecuteMetadataFinderWithKMSUpdate.NameSpace, !GetAtt ExecuteMetadataFinderNoKMSUpdate.NameSpace ], "default" ]
@@ -3181,7 +3408,7 @@ Resources:
       ServiceTimeout: 900
       ServiceToken: !GetAtt QueryExecutor.Arn
       QueryID: !GetAtt CreateMetadataPITTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateMetadataPITTable/"
       OnlyIfMetadataFound: true
       NameSpace: !If [ CreateKMSUpdate, !GetAtt ExecuteMetadataFinderWithKMSUpdate.NameSpace, !GetAtt ExecuteMetadataFinderNoKMSUpdate.NameSpace ]
@@ -3207,7 +3434,7 @@ Resources:
       ServiceTimeout: 900
       ServiceToken: !GetAtt QueryExecutor.Arn
       QueryID: !GetAtt CreateCSVImportTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateCSVImportTable/"
 
   ExecuteCSVChecker:
@@ -3219,7 +3446,7 @@ Resources:
       ServiceTimeout: 60
       ServiceToken: !GetAtt CSVChecker.Arn
       QueryID: !GetAtt CheckCSVImportTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CheckCSV/"
       CSVLocation: !Ref InventoryCSVLocation
       Bucket: !Ref BucketName
@@ -3233,7 +3460,7 @@ Resources:
       ServiceTimeout: 900
       ServiceToken: !GetAtt QueryExecutor.Arn
       QueryID: !GetAtt CreateCSVPITTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateCSVPITTable/"
 
   ExecuteCreateAllVersionsTable:
@@ -3244,7 +3471,7 @@ Resources:
       ServiceTimeout: 900
       ServiceToken: !GetAtt QueryExecutor.Arn
       QueryID: !GetAtt CreateAllVersionsTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateAllVersionsTable/"
       Dependency:
         - !If [ CreateInventory, !GetAtt ExecuteCreateInventoryPITTable.State, !GetAtt ExecuteCreateCSVPITTable.State ]
@@ -3260,7 +3487,7 @@ Resources:
       ServiceTimeout: 900
       ServiceToken: !GetAtt QueryExecutor.Arn
       QueryID: !GetAtt CreateLatestVersionsTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateLatestVersionsTable/"
 
   ExecuteCreateDesiredTable:
@@ -3273,7 +3500,7 @@ Resources:
       ServiceTimeout: 900
       ServiceToken: !GetAtt QueryExecutor.Arn
       QueryID: !GetAtt CreateDesiredTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateDesiredTable/"
 
   ExecuteCreateDesiredVersionsTable:
@@ -3286,7 +3513,7 @@ Resources:
       ServiceTimeout: 900
       ServiceToken: !GetAtt QueryExecutor.Arn
       QueryID: !GetAtt CreateDesiredVersionsTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateDesiredVersionsTable/"
 
   ExecuteCreateChangedKeysTable:
@@ -3300,7 +3527,7 @@ Resources:
       ServiceTimeout: 900
       ServiceToken: !GetAtt QueryExecutor.Arn
       QueryID: !GetAtt CreateChangedKeysTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateChangedKeysTable/"
 
   ExecuteCreateCountVersionsTable:
@@ -3315,7 +3542,7 @@ Resources:
       ServiceTimeout: 900
       ServiceToken: !GetAtt QueryExecutor.Arn
       QueryID: !GetAtt CreateCountVersionsTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateCountVersionsTable/"
 
   ExecuteCreateLatestDMsTable:
@@ -3328,7 +3555,7 @@ Resources:
       ServiceTimeout: 900
       ServiceToken: !GetAtt QueryExecutor.Arn
       QueryID: !GetAtt CreateLatestDMsTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateLatestDMsTable/"
 
   ExecuteCreateScenario1Table:
@@ -3343,7 +3570,7 @@ Resources:
       ServiceTimeout: 900
       ServiceToken: !GetAtt QueryExecutor.Arn
       QueryID: !GetAtt CreateScenario1Table.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario1Table/"
 
   ExecuteCreateScenario2Table:
@@ -3356,7 +3583,7 @@ Resources:
       ServiceTimeout: 900
       ServiceToken: !GetAtt QueryExecutor.Arn
       QueryID: !GetAtt CreateScenario2Table.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario2Table/"
 
   ExecuteCreateScenario2UndoTable:
@@ -3369,7 +3596,7 @@ Resources:
       ServiceTimeout: 900
       ServiceToken: !GetAtt QueryExecutor.Arn
       QueryID: !GetAtt CreateScenario2UndoTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario2UndoTable/"
 
   ExecuteCreateScenario3aTable:
@@ -3383,7 +3610,7 @@ Resources:
       ServiceTimeout: 900
       ServiceToken: !GetAtt QueryExecutor.Arn
       QueryID: !GetAtt CreateScenario3aTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario3aTable/"
 
   ExecuteCreateScenario3bTable:
@@ -3397,7 +3624,7 @@ Resources:
       ServiceTimeout: 900
       ServiceToken: !GetAtt QueryExecutor.Arn
       QueryID: !GetAtt CreateScenario3bTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario3bTable/"
 
   ExecuteCreateScenario3cTable:
@@ -3411,7 +3638,7 @@ Resources:
       ServiceTimeout: 900
       ServiceToken: !GetAtt QueryExecutor.Arn
       QueryID: !GetAtt CreateScenario3cTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario3cTable/"
 
   ExecuteCreateScenario4Table:
@@ -3424,7 +3651,7 @@ Resources:
       ServiceTimeout: 900
       ServiceToken: !GetAtt QueryExecutor.Arn
       QueryID: !GetAtt CreateScenario4Table.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario4Table/"
 
   ExecuteCreateScenario4UndoTable:
@@ -3437,7 +3664,7 @@ Resources:
       ServiceTimeout: 900
       ServiceToken: !GetAtt QueryExecutor.Arn
       QueryID: !GetAtt CreateScenario4UndoTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario4UndoTable/"
 
   ExecuteCreateScenario5aTable:
@@ -3450,7 +3677,7 @@ Resources:
       ServiceTimeout: 900
       ServiceToken: !GetAtt QueryExecutor.Arn
       QueryID: !GetAtt CreateScenario5aTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario5aTable/"
 
   ExecuteCreateScenario5bTable:
@@ -3463,7 +3690,7 @@ Resources:
       ServiceTimeout: 900
       ServiceToken: !GetAtt QueryExecutor.Arn
       QueryID: !GetAtt CreateScenario5bTable.NamedQueryId
-      WorkGroup: !Ref AthenaWorkGroup
+      WorkGroup: !If [UseSharedWorkGroup, !Ref SharedAthenaWorkGroupName, !Ref AthenaWorkGroup]
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario5bTable/"
 
   ExecuteManifestMaker:
@@ -3515,7 +3742,7 @@ Resources:
       ReportPrefix: "Reports/scenario1"
       Description: "Scenario 1 - Add delete markers"
       FunctionArn: !GetAtt S3BatchOpsDeleteFunction.Arn
-      S3BatchOpsRoleArn: !GetAtt S3BatchOpsExecutorRole.Arn
+      S3BatchOpsRoleArn: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsExecutorRole.Arn]
       StartJob: !Ref StartS3BatchOperationsJobs
 
   ExecuteS3BatchOpsDeleteCreator2:
@@ -3534,7 +3761,7 @@ Resources:
       ReportPrefix: "Reports/scenario2"
       Description: "Scenario 2 - Delete delete markers"
       FunctionArn: !GetAtt S3BatchOpsDeleteFunction.Arn
-      S3BatchOpsRoleArn: !GetAtt S3BatchOpsExecutorRole.Arn
+      S3BatchOpsRoleArn: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsExecutorRole.Arn]
       StartJob: !Ref StartS3BatchOperationsJobs
 
   ExecuteS3BatchOpsCopyCreator3b:
@@ -3555,7 +3782,7 @@ Resources:
       DestinationBucket: !Ref BucketName
       StorageClass: !Ref StorageClass
       KMSKey: !If [ WantKMS, !Ref KMSKey, !Ref "AWS::NoValue" ]
-      S3BatchOpsRoleArn: !GetAtt S3BatchOpsExecutorRole.Arn
+      S3BatchOpsRoleArn: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsExecutorRole.Arn]
       StartJob: !Ref StartS3BatchOperationsJobs
 
   ExecuteS3BatchOpsCopyCreator3c:
@@ -3577,7 +3804,7 @@ Resources:
       FunctionArn: !GetAtt S3BatchOpsCopyFunction.Arn
       StorageClass: !Ref StorageClass
       KMSKey: !If [WantKMS, !Ref KMSKey, !Ref "AWS::NoValue" ]
-      S3BatchOpsRoleArn: !GetAtt S3BatchOpsExecutorRole.Arn
+      S3BatchOpsRoleArn: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsExecutorRole.Arn]
       StartJob: !Ref StartS3BatchOperationsJobs
 
   ExecuteS3BatchOpsDeleteCreator4:
@@ -3596,7 +3823,7 @@ Resources:
       ReportPrefix: "Reports/scenario4"
       Description: "Scenario 4 - Remove latest DMs"
       FunctionArn: !GetAtt S3BatchOpsDeleteFunction.Arn
-      S3BatchOpsRoleArn: !GetAtt S3BatchOpsExecutorRole.Arn
+      S3BatchOpsRoleArn: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsExecutorRole.Arn]
       StartJob: !Ref StartS3BatchOperationsJobs
 
   ExecuteS3BatchOpsCopyCreator5b:
@@ -3618,12 +3845,12 @@ Resources:
       FunctionArn: !GetAtt S3BatchOpsCopyFunction.Arn
       StorageClass: !Ref StorageClass
       KMSKey: !If [WantKMS, !Ref KMSKey, !Ref "AWS::NoValue" ]
-      S3BatchOpsRoleArn: !GetAtt S3BatchOpsExecutorRole.Arn
+      S3BatchOpsRoleArn: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsExecutorRole.Arn]
       StartJob: !Ref StartS3BatchOperationsJobs
 
   KMSUpdateFunctionRole:
     Type: AWS::IAM::Role
-    Condition: CreateKMSUpdate
+    Condition: CreateOwnKMSUpdateFunctionRole
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -3667,8 +3894,8 @@ Resources:
       FunctionName: !Sub "${AWS::StackName}-KMSUpdate"
       Runtime: python3.11
       Handler: index.handler
-      Role: !GetAtt KMSUpdateFunctionRole.Arn
-      Timeout: 60
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt KMSUpdateFunctionRole.Arn]
+      Timeout: 180
       Code:
         ZipFile: |
           import json
@@ -3723,12 +3950,56 @@ Resources:
                   policy["Version"] = "2012-10-17"
               return policy
 
+          import re
+          _ROLE_ID_RE = re.compile(r'^AROA[A-Z0-9]+$')
+
+          def _scrub_stale_principals(policy):
+              # When an IAM role is deleted, KMS replaces its ARN with the raw role ID
+              # (e.g. AROA123456789EXAMPLE) in the key policy. PutKeyPolicy rejects any
+              # policy that contains these orphaned IDs with MalformedPolicyDocumentException.
+              # This function removes such statements so subsequent PutKeyPolicy calls succeed.
+              clean = []
+              for st in policy.get("Statement", []):
+                  principal = st.get("Principal", {})
+                  aws = principal.get("AWS") if isinstance(principal, dict) else None
+                  if aws is None:
+                      clean.append(st)
+                      continue
+                  arns = aws if isinstance(aws, list) else [aws]
+                  valid = [a for a in arns if not _ROLE_ID_RE.match(a)]
+                  if not valid:
+                      print(f"Dropping stale KMS statement (Sid={st.get('Sid')!r}) "
+                            f"with deleted principal(s): {arns}")
+                      continue
+                  if len(valid) < len(arns):
+                      removed = [a for a in arns if _ROLE_ID_RE.match(a)]
+                      print(f"Removing stale principal(s) {removed} from statement Sid={st.get('Sid')!r}")
+                      st = dict(st)
+                      st["Principal"] = dict(st["Principal"])
+                      st["Principal"]["AWS"] = valid[0] if len(valid) == 1 else valid
+                  clean.append(st)
+              policy["Statement"] = clean
+              return policy
+
           def _put_policy(key_id, policy_name, policy):
-              kms.put_key_policy(
-                  KeyId=key_id,
-                  PolicyName=policy_name,
-                  Policy=json.dumps(policy)
-              )
+              import time
+              # Retry on MalformedPolicyDocumentException — this can occur when a newly
+              # created IAM role hasn't fully propagated before KMS validates the principal.
+              for attempt in range(8):
+                  try:
+                      kms.put_key_policy(
+                          KeyId=key_id,
+                          PolicyName=policy_name,
+                          Policy=json.dumps(policy)
+                      )
+                      return
+                  except kms.exceptions.MalformedPolicyDocumentException:
+                      if attempt == 7:
+                          raise
+                      wait = 2 ** attempt  # 1, 2, 4, 8, 16, 32, 64s
+                      print(f"MalformedPolicyDocumentException on attempt {attempt+1}, "
+                            f"retrying in {wait}s (IAM propagation delay) ...")
+                      time.sleep(wait)
 
           def _ensure_statement(policy, sid, principal_arn):
               # Remove any existing statement with the same Sid, then re-add desired statement.
@@ -3778,6 +4049,7 @@ Resources:
 
                   if request_type in ["Create", "Update"]:
                       policy = _load_policy(key_id, policy_name)
+                      policy = _scrub_stale_principals(policy)
                       policy = _ensure_statement(policy, sid, principal_arn)
                       _put_policy(key_id, policy_name, policy)
 
@@ -3789,11 +4061,19 @@ Resources:
                       return
 
                   if request_type == "Delete":
-                      # Best effort cleanup
-                      policy = _load_policy(key_id, policy_name)
-                      policy, removed = _remove_statement(policy, sid)
-                      if removed:
-                          _put_policy(key_id, policy_name, policy)
+                      # Best effort cleanup — if the execution role no longer exists
+                      # (e.g. orchestrator stack deleted before child stack cleanup
+                      # completed), skip silently. The stale statement will be scrubbed
+                      # by _scrub_stale_principals on the next KMS policy update.
+                      try:
+                          policy = _load_policy(key_id, policy_name)
+                          policy = _scrub_stale_principals(policy)
+                          policy, removed = _remove_statement(policy, sid)
+                          if removed:
+                              _put_policy(key_id, policy_name, policy)
+                      except Exception as e:
+                          print(f"Warning: KMS policy cleanup skipped: {e}")
+                          removed = False
 
                       _send_response(
                           event, context, "SUCCESS",
@@ -3819,9 +4099,22 @@ Resources:
     Condition: CreateKMSUpdate
     Type: Custom::KMSUpdate
     Properties:
+      ServiceTimeout: 180
       ServiceToken: !GetAtt KMSUpdateFunction.Arn
       KeyId: !Ref ExistingKmsKeyIdOrArn
-      PrincipalArn: !GetAtt MetadataFinderRole.Arn
+      PrincipalArn: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt MetadataFinderRole.Arn]
+
+  # Grant the QueryExecutorRole KMS access to the metadata table key so Athena
+  # can decrypt the KMS-encrypted S3 Metadata tables during query execution.
+  # Only needed in own-roles mode — in shared-role mode KMSUpdate covers both.
+  KMSUpdateQueryExecutor:
+    Condition: CreateOwnKMSUpdateFunctionRole
+    Type: Custom::KMSUpdate
+    Properties:
+      ServiceTimeout: 180
+      ServiceToken: !GetAtt KMSUpdateFunction.Arn
+      KeyId: !Ref ExistingKmsKeyIdOrArn
+      PrincipalArn: !GetAtt QueryExecutorRole.Arn
 
 
 Outputs:    
@@ -3852,12 +4145,12 @@ Outputs:
   CopyRole3b:
     Condition: WantRollback
     Description: ARN of the IAM Role used by the S3 Batch Operations Copy Job (Scenario 3b)
-    Value: !GetAtt S3BatchOpsExecutorRole.Arn
+    Value: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsExecutorRole.Arn]
 
   CopyRole3c:
     Condition: WantRollback
     Description: ARN of the IAM Role used by the S3 Batch Operations Copy Job (Scenario 3c)
-    Value: !GetAtt S3BatchOpsCopyFunctionRole.Arn
+    Value: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsCopyFunctionRole.Arn]
 
   S3BatchOperationsCopy5bJob:
     Condition: WantCopy
@@ -3867,7 +4160,7 @@ Outputs:
   CopyRole5b:
     Condition: WantCopy
     Description: ARN of the IAM Role used by the S3 Batch Operations Copy Job (Scenario 5b)
-    Value: !GetAtt S3BatchOpsExecutorRole.Arn
+    Value: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsExecutorRole.Arn]
 
   S3BatchOperationsDelete4Job:
     Condition: WantDMRemoval
