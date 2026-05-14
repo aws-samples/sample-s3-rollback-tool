@@ -1,6 +1,6 @@
 # Running against multiple buckets with s3-rollback-orchestrator.yaml
 
-The `s3-rollback-orchestrator.yaml` CloudFormation template drives the [S3 rollback tool](readme.md) across many buckets in a single account and region. It reads an input CSV from Amazon S3 and deploys one child CloudFormation stack per row using [`s3-rollback.yaml`](s3-rollback.yaml), applying the same timestamp and execution mode to each. To keep IAM role count manageable at scale, the orchestrator can create a single shared IAM role that all child stacks use instead of each creating their own.
+The `s3-rollback-orchestrator.yaml` CloudFormation template drives the [Rollback Tool for Amazon S3](https://github.com/aws-solutions-library-samples/guidance-for-rolling-back-changes-to-datasets-in-amazon-s3) across many buckets in a single account and region. It reads an input CSV from Amazon S3 and deploys one child CloudFormation stack per row using [`s3-rollback.yaml`](s3-rollback.yaml), applying the same timestamp and execution mode to each. To keep IAM role count manageable at scale, the orchestrator can create a single shared IAM role that all child stacks use instead of each creating their own.
 
 Use it when you need to revert or recreate datasets in many buckets from the same point in time, without deploying the rollback template manually for each one.
 
@@ -54,7 +54,7 @@ The child stacks are standard `s3-rollback.yaml` deployments. Each creates its o
 
 ## Prerequisites
 
-In addition to the [rollback tool prerequisites](readme.md#prerequisites) for every bucket in scope:
+In addition to the [Rollback Tool for Amazon S3 prerequisites](readme.md#prerequisites) for every bucket in scope:
 
 1. **Stage `s3-rollback.yaml` in S3.** Upload the `s3-rollback.yaml` template from this repository to an S3 bucket you control. The orchestrator references it by HTTPS URL (for example, `https://my-templates.s3.us-east-1.amazonaws.com/s3-rollback.yaml`). Make sure the URL is readable by CloudFormation in the account and region where you deploy the orchestrator.
 2. **Results bucket.** Create or identify a single S3 bucket to receive the orchestrator results CSV. It must be in the same region as the orchestrator stack. Each child stack creates its own temporary bucket for its manifests, Athena output, and S3 Batch Operations reports, so only the orchestrator's results CSV is written here.
