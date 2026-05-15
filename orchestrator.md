@@ -2,7 +2,7 @@
 
 The `s3-rollback-orchestrator.yaml` CloudFormation template drives the [Rollback Tool for Amazon S3](https://github.com/aws-solutions-library-samples/guidance-for-rolling-back-changes-to-datasets-in-amazon-s3) across many buckets in a single account and region. It reads an input CSV from Amazon S3 and deploys one child CloudFormation stack per row using [`s3-rollback.yaml`](s3-rollback.yaml), applying the same timestamp and execution mode to each. To keep IAM role count manageable at scale, the orchestrator can create a single shared IAM role that all child stacks use instead of each creating their own.
 
-Use it when you need to revert or recreate datasets in many buckets from the same point in time, without deploying the rollback template manually for each one.
+Use it when you need to undo changes in many buckets, without deploying the rollback template manually for each one.
 
 ## Table of Contents
 
