@@ -9,6 +9,7 @@
 
 - [Overview](#overview)
   - [Cost](#cost)
+- [When to Use This Tool](#when-to-use-this-tool)
 - [Prerequisites](#prerequisites)
 - [Deploying and Running the Guidance](#deploying-and-running-the-guidance)
   - [Large-scale template (s3-rollback-glue-metadata.yaml)](#large-scale-template-s3-rollback-glue-metadatayaml)
@@ -38,7 +39,18 @@
 - [Authors](#authors)
 
 ## Overview
-If you want to revert undesired changes to a dataset in Amazon S3, as quickly as possible, this tool is for you. It can detect and revert thousands of changes in under 15 minutes, 10 million changes in under an hour, or 100 million changes in under 5 hours. Alternatively, it can recreate a desired point in time into an empty bucket.
+
+Organizations storing large datasets in Amazon S3 face a critical challenge: how to quickly recover from accidental deletions, overwrites, or unwanted changes that affect millions or billions of objects. Traditional restoration methods — such as restoring from backup or copying entire datasets — can take days or weeks and cost orders of magnitude more than necessary.
+
+The **Rollback Tool for Amazon S3** solves this by *only undoing the changes*, using S3 Versioning. It can detect and revert:
+
+- **Thousands** of changes in under **15 minutes** (end-to-end)
+- **10 million** changes in under **1 hour**
+- **100 million** changes in under **5 hours**
+
+Alternatively, it can recreate a desired point-in-time state into a separate bucket.
+
+> 📖 **Read the full story:** [Rapid and scalable data recovery using Amazon S3 Versioning with the Rollback Tool for Amazon S3](https://repost.aws/articles/AR4_5B3P3MSuiHgvI_oiCXzg/rapid-and-scalable-data-recovery-using-amazon-s3-versioning-with-the-rollback-tool-for-amazon-s3-an-aws-open-source-sample) on AWS re:Post.
 
 The only [Prerequisites](#prerequisites) are that [S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html) is enabled, and the desired versions still exist. If your bucket, or the prefix in scope, has up to 10 million objects, you can get started in under an hour after the undesired event by [creating a real-time inventory](#creating-a-real-time-inventory-using-the-listobjectversions-api). For buckets with [S3 Metadata live inventory tables](https://aws.amazon.com/blogs/aws/amazon-s3-metadata-now-supports-metadata-for-all-your-s3-objects/) enabled, you can get started in only 15 minutes. **We strongly advise that you enable S3 Metadata to accelerate and simplify recovery - see [this video](https://www.youtube.com/watch?v=2XR2trZvv7w) for a walkthrough.** If you don't want to enable S3 Metadata you can get started in under 48 hours with an [S3 Inventory report](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html).
 
@@ -95,6 +107,21 @@ If using the large-scale template (`s3-rollback-glue-metadata.yaml`) with defaul
 - 'Copy to Bucket' mode copies every object (that was current at the timestamp) using S3 Batch Operations and Lambda. Cross-region copies will incur cross-region data transfer charges, and the lower throughput may increase Lambda compute time.
 - S3 does not charge for DELETE operations.
 - If the CloudFormation stack is not deleted after rollback is complete, ongoing S3 storage charges will apply for the temporary S3 bucket. See [Cleanup](#cleanup).
+
+## When to Use This Tool
+
+| Scenario | Example | Recommended Mode |
+|---|---|---|
+| Bulk accidental deletion (most common) | Lifecycle rule or script soft-deleted thousands/millions of objects | **Delete Marker Removal** |
+| Ransomware or malicious overwrites | Attacker encrypted objects in place | **Bucket Rollback** |
+| Bad deployment overwrote dataset | CI/CD pipeline pushed wrong data | **Bucket Rollback** |
+| Need a clean copy as it was at time T | Forensic / audit snapshot | **Copy to Bucket** |
+| Multiple buckets affected simultaneously | Enterprise-wide incident | **Orchestrator** (multi-bucket) |
+
+> **💡 Tip:** Removing delete markers is the single most common recovery scenario at scale. If your objects were soft-deleted (not overwritten), Delete Marker Removal mode is the fastest and simplest option.
+
+> **Important:** This tool enables rapid *in-place* recovery using S3 Versioning. It does not replace the need for independent backups (e.g. cross-account or cross-region copies) for comprehensive disaster and cyber recovery strategies. See the [Ensuring Recoverability](#ensuring-recoverability) section for guidance on protecting your version history.
+
 ## Prerequisites
 
 1. [S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html) must be enabled on your Amazon S3 bucket, and must have been enabled prior to the undesired event.
@@ -207,6 +234,12 @@ If you prefer to copy your dataset into an empty bucket or prefix, as it was at 
 
 
 ## Scenarios covered
+
+> **Most common:** If objects were soft-deleted and you simply need to "undelete" them, start with [Delete Marker Removal mode](#delete-marker-removal-mode) — it's the fastest path to recovery.
+
+1. **Delete Marker Removal mode** — Remove delete markers placed after a specified time
+2. **Bucket Rollback mode** — Full point-in-time revert (handles DELETEs, overwrites, and non-overwrite PUTs)
+3. **Copy to Bucket mode** — Recreate point-in-time state in a different bucket
 
 Scenarios differ depending on the selected mode. For each object key (name) in scope of the prefix filter:
 
