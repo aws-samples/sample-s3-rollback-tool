@@ -5,6 +5,8 @@
 
 >  **Disclaimer:** Code is provided as-is, to demonstrate a concept or workflow to AWS customers. You should ensure it meets your requirements, and carefully review the S3 Batch Operations manifests and tasks before running any jobs against non-test data.
 
+📖 **Read the full story:** [Rapid and scalable data recovery using Amazon S3 Versioning with the Rollback Tool for Amazon S3](https://repost.aws/articles/AR4_5B3P3MSuiHgvI_oiCXzg/rapid-and-scalable-data-recovery-using-amazon-s3-versioning-with-the-rollback-tool-for-amazon-s3-an-aws-open-source-sample) on AWS re:Post.
+
 ## Table of Contents
 
 - [Overview](#overview)
@@ -49,8 +51,6 @@ The **Rollback Tool for Amazon S3** solves this by *only undoing the changes*, u
 - **100 million** changes in under **5 hours**
 
 Alternatively, it can recreate a desired point-in-time state into a separate bucket.
-
-> 📖 **Read the full story:** [Rapid and scalable data recovery using Amazon S3 Versioning with the Rollback Tool for Amazon S3](https://repost.aws/articles/AR4_5B3P3MSuiHgvI_oiCXzg/rapid-and-scalable-data-recovery-using-amazon-s3-versioning-with-the-rollback-tool-for-amazon-s3-an-aws-open-source-sample) on AWS re:Post.
 
 The only [Prerequisites](#prerequisites) are that [S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html) is enabled, and the desired versions still exist. If your bucket, or the prefix in scope, has up to 10 million objects, you can get started in under an hour after the undesired event by [creating a real-time inventory](#creating-a-real-time-inventory-using-the-listobjectversions-api). For buckets with [S3 Metadata live inventory tables](https://aws.amazon.com/blogs/aws/amazon-s3-metadata-now-supports-metadata-for-all-your-s3-objects/) enabled, you can get started in only 15 minutes. **We strongly advise that you enable S3 Metadata to accelerate and simplify recovery - see [this video](https://www.youtube.com/watch?v=2XR2trZvv7w) for a walkthrough.** If you don't want to enable S3 Metadata you can get started in under 48 hours with an [S3 Inventory report](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html).
 
