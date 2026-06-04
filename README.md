@@ -1,11 +1,9 @@
 
 # Guidance for rolling back changes to datasets in Amazon S3
 
-#### Recovery of data in Amazon S3, at scale, using S3 Versioning.
+📖 **Read the full story:** [Rapid and scalable data recovery using Amazon S3 Versioning with the Rollback Tool for Amazon S3](https://repost.aws/articles/AR4_5B3P3MSuiHgvI_oiCXzg/rapid-and-scalable-data-recovery-using-amazon-s3-versioning-with-the-rollback-tool-for-amazon-s3-an-aws-open-source-sample) on AWS re:Post.
 
 >  **Disclaimer:** Code is provided as-is, to demonstrate a concept or workflow to AWS customers. You should ensure it meets your requirements, and carefully review the S3 Batch Operations manifests and tasks before running any jobs against non-test data.
-
-📖 **Read the full story:** [Rapid and scalable data recovery using Amazon S3 Versioning with the Rollback Tool for Amazon S3](https://repost.aws/articles/AR4_5B3P3MSuiHgvI_oiCXzg/rapid-and-scalable-data-recovery-using-amazon-s3-versioning-with-the-rollback-tool-for-amazon-s3-an-aws-open-source-sample) on AWS re:Post.
 
 ## Table of Contents
 
